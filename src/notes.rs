@@ -38,10 +38,13 @@
 
 #![allow(
     dead_code,
-    reason = "the panel reads (`path`, `load`, `len`); what is still uncalled is \
-              the reload path (`changed`) and the write path (`render`, `store`, \
-              `update`, `toggle`, `is_empty`), which the worker and the panel's \
-              input mode consume. Remove this attribute with that change"
+    reason = "the read path is live — `path`/`load`/`len` from the panel, \
+              `changed`/`Stamp::of` from the worker's watch. What is left is \
+              exactly the write path (`render`, `store`, `store_locked`, \
+              `update`, `toggle`, `is_empty`), which the panel's input mode \
+              consumes. Delete this attribute with that change; it is a \
+              module-wide allow only because `store_locked` is private and \
+              would still warn if its callers were exempted one by one"
 )]
 
 use std::fs::{self, File, OpenOptions};

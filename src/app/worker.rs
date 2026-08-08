@@ -5,6 +5,7 @@
 //! occasionally draw — so a slow `git` on a network mount or a busy tmux server
 //! can never stall input or leave a half-painted frame on screen.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,7 @@ use std::time::Duration;
 
 use crate::git::GitCache;
 use crate::model::SessionGroup;
+use crate::notes::{self, NoteFile, Stamp};
 use crate::preview::{self, PanePreview};
 use crate::tmux;
 
@@ -36,6 +38,13 @@ pub struct Snapshot {
     /// the same `list-panes` the tree comes from, so it costs no extra subprocess and
     /// cannot disagree with the tree it arrives with.
     pub focused: Option<String>,
+    /// A reparsed scratchpad, present only on a pass where the file actually
+    /// changed.
+    ///
+    /// `None` means *unchanged*, not *empty* — the panel keeps what it has. That
+    /// distinction is the whole point: the common pass does one `stat` and sends
+    /// nothing, so an idle sidebar with notes open still draws zero frames.
+    pub notes: Option<NoteFile>,
 }
 
 pub struct Worker {
@@ -76,7 +85,12 @@ impl Worker {
 ///
 /// `own_pane` is the sidebar's own pane id, used only to resolve which pane tmux
 /// focus is on (see [`tmux::focused_pane`]); empty for a popup.
-pub fn spawn(agents_only: bool, own_pane: String) -> Worker {
+///
+/// `notes_file` is resolved by the caller rather than here, because resolving it
+/// reads a tmux option and this thread should not pay for that once a second.
+/// `None` turns the watch off entirely, which is how a popup avoids a `stat` per
+/// pass for a panel it will never draw.
+pub fn spawn(agents_only: bool, own_pane: String, notes_file: Option<PathBuf>) -> Worker {
     let (tx, rx) = mpsc::channel();
     let wake = Arc::new(AtomicBool::new(false));
     let thread_wake = Arc::clone(&wake);
@@ -85,6 +99,11 @@ pub fn spawn(agents_only: bool, own_pane: String) -> Worker {
 
     thread::spawn(move || {
         let mut git = GitCache::new();
+        // Starts unread, so the first pass reparses whatever `run` already loaded
+        // at startup. One redundant parse of a small file, off the UI thread,
+        // producing identical lines — the fingerprint does not move and nothing
+        // is drawn. Cheaper than threading the startup stamp across the channel.
+        let mut notes_stamp = Stamp::MISSING;
         loop {
             // A tmux failure here means the server is gone, and so is our pane;
             // there is nothing to report and nothing to retry.
@@ -103,11 +122,15 @@ pub fn spawn(agents_only: bool, own_pane: String) -> Worker {
                 let panes = preview::capture_window(&window_id);
                 (window_id, panes)
             });
+            let notes = notes_file
+                .as_deref()
+                .and_then(|path| reload_notes(path, &mut notes_stamp));
             if tx
                 .send(Snapshot {
                     sessions,
                     preview,
                     focused,
+                    notes,
                 })
                 .is_err()
             {
@@ -121,6 +144,37 @@ pub fn spawn(agents_only: bool, own_pane: String) -> Worker {
         rx,
         wake,
         preview_target,
+    }
+}
+
+/// Reparse the scratchpad, but only if it moved since `stamp`.
+///
+/// The `stat` is the whole design: the sidebar is open for hours beside a file
+/// almost nobody is writing, so the common pass must cost one syscall and
+/// produce nothing. Reading and re-parsing every second would be affordable in
+/// CPU and still wrong — [`crate::app::fingerprint`] would see identical text
+/// and skip the draw, but we would have spent the work to learn that.
+///
+/// `stamp` is advanced on any *observed* change, a read failure included. A file
+/// that appears mid-write parses as whatever is on disk right now; the next pass
+/// sees a new size or mtime and corrects it. Refusing to advance instead would
+/// re-read a permanently unreadable file once a second, forever.
+///
+/// Split out of the loop so it can be tested against a real temp file without a
+/// thread, matching how the rest of the crate splits a decision from its caller.
+fn reload_notes(path: &Path, stamp: &mut Stamp) -> Option<NoteFile> {
+    if !notes::changed(path, *stamp) {
+        return None;
+    }
+    match notes::load(path) {
+        Ok((file, fresh)) => {
+            *stamp = fresh;
+            Some(file)
+        }
+        Err(_) => {
+            *stamp = Stamp::of(path);
+            None
+        }
     }
 }
 
@@ -180,6 +234,83 @@ fn collect(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    // ─── the notes watch ──────────────────────────────────────────────
+
+    /// A scratchpad in a temp dir, and its path. Named per test so a parallel
+    /// run cannot have two tests writing the same file.
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("agent-mgr-worker-{name}.md"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn write(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("write scratch notes");
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_reparsed() {
+        // The point of the `stat`: a sidebar open for hours beside a file nobody
+        // is writing must send nothing, or the panel becomes the one thing that
+        // keeps the loop awake.
+        let path = scratch("unchanged");
+        write(&path, "## [ ] one\n");
+        let mut stamp = Stamp::MISSING;
+
+        assert!(reload_notes(&path, &mut stamp).is_some(), "the first read");
+        for _ in 0..5 {
+            assert!(
+                reload_notes(&path, &mut stamp).is_none(),
+                "an untouched file must not come back a second time"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_appended_note_comes_back_on_the_next_pass() {
+        let path = scratch("appended");
+        write(&path, "## [ ] one\n");
+        let mut stamp = Stamp::MISSING;
+        let first = reload_notes(&path, &mut stamp).expect("the first read");
+        assert_eq!(first.len(), 1);
+
+        write(&path, "## [ ] one\n\n## [ ] two\n");
+        let second = reload_notes(&path, &mut stamp).expect("the append");
+        assert_eq!(second.len(), 2);
+        assert_eq!(second.notes[1].title, "two");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_scratchpad_that_never_existed_reports_nothing_every_pass() {
+        // The first run has no file, and a panel is not worth waking the loop for
+        // once a second to rediscover that.
+        let path = scratch("absent");
+        let mut stamp = Stamp::MISSING;
+        for _ in 0..3 {
+            assert!(reload_notes(&path, &mut stamp).is_none());
+        }
+    }
+
+    #[test]
+    fn a_file_deleted_under_us_empties_the_panel_once() {
+        // Once, not every pass: the deletion is a change, and what follows is a
+        // steady state that must go quiet again.
+        let path = scratch("deleted");
+        write(&path, "## [ ] one\n");
+        let mut stamp = Stamp::MISSING;
+        assert!(reload_notes(&path, &mut stamp).is_some());
+
+        std::fs::remove_file(&path).expect("remove scratch notes");
+        let emptied = reload_notes(&path, &mut stamp).expect("the deletion");
+        assert!(emptied.is_empty(), "a missing file reads as an empty one");
+        assert!(
+            reload_notes(&path, &mut stamp).is_none(),
+            "and then nothing more"
+        );
+    }
 
     #[test]
     fn wait_returns_early_when_a_refresh_is_requested() {

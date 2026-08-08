@@ -29,6 +29,16 @@ const DONE_BOX: &str = "[x]";
 /// beside it do not shift as the panel scrolls.
 const MORE_BELOW: &str = "↓";
 
+/// Fills the header between the label and the counts.
+///
+/// The panel butts straight up against the last pane row, and with a full list
+/// the muted label alone is not enough to say "a different thing starts here".
+/// A rule costs no rows, which is the only currency the sidebar is short of.
+const RULE: char = '─';
+/// Below this the rule is a stub that reads as a stray dash, so the header falls
+/// back to plain spaces. Two cells of rule plus the space either side.
+const MIN_RULE_ROOM: usize = 4;
+
 /// The rendered panel: lines to draw, and their text to hash.
 #[derive(Default)]
 pub struct RenderedNotes {
@@ -99,8 +109,9 @@ pub fn build(file: &NoteFile, opts: &Options, theme: &Theme) -> RenderedNotes {
     out
 }
 
-/// `notes            ↓ 2/5` — the label, then how much is open and how much of
-/// it you are looking at.
+/// `notes ───────────── ↓ 2/5` — the label, a rule to divide the panel off from
+/// the list above it, then how much is open and how much of it you are looking
+/// at.
 ///
 /// The counts are always shown rather than only when they are interesting: a
 /// number that appears and disappears makes the row jump, and "how many of these
@@ -121,12 +132,23 @@ fn header(file: &NoteFile, hidden: usize, total_width: usize, theme: &Theme) -> 
     let right = truncate(&right, avail);
     let label = truncate("notes", avail.saturating_sub(width(&right) + 1));
 
-    let used = indent + width(&label) + width(&right);
+    // Whatever is left between the two, spaces included. A narrow sidebar spends
+    // it on spaces rather than on a two-cell stub that reads as a typo.
+    let room = avail - width(&label) - width(&right);
+    let rule = if room >= MIN_RULE_ROOM {
+        format!(" {} ", String::from(RULE).repeat(room - 2))
+    } else {
+        " ".repeat(room)
+    };
+
+    let muted = Style::default().fg(theme.muted);
     vec![
         Span::raw(" ".repeat(indent)),
-        Span::styled(label, Style::default().fg(theme.muted)),
-        Span::raw(pad_to(used, total_width)),
-        Span::styled(right, Style::default().fg(theme.muted)),
+        Span::styled(label, muted),
+        // Dimmer than the label it follows: the rule is structure, not content,
+        // and at full strength it out-shouts the note titles below it.
+        Span::styled(rule, muted.add_modifier(Modifier::DIM)),
+        Span::styled(right, muted),
     ]
 }
 
@@ -285,6 +307,44 @@ mod tests {
         );
         assert!(lines[0].contains("2/3"), "{:?}", lines[0]);
         assert!(lines[0].contains("notes"), "{:?}", lines[0]);
+    }
+
+    #[test]
+    fn the_header_rules_the_panel_off_from_the_list_above_it() {
+        // With a full pane list the panel starts immediately under the last pane
+        // row, and a muted label alone does not say "a different thing begins
+        // here". The rule costs no rows, which is the currency the sidebar is
+        // short of.
+        let notes = file(&[("a", false)]);
+        let wide = render(
+            &notes,
+            Options {
+                total_width: 40,
+                height: 2,
+                ..Options::default()
+            },
+        );
+        assert!(wide[0].contains(RULE), "{:?}", wide[0]);
+        // The label and the counts still keep their own space around it.
+        assert!(wide[0].starts_with(" notes "), "{:?}", wide[0]);
+        assert!(wide[0].ends_with(" 1/1"), "{:?}", wide[0]);
+    }
+
+    #[test]
+    fn a_narrow_header_drops_the_rule_rather_than_stubbing_it() {
+        // Two dashes between a label and a number reads as a typo, not as a
+        // divider.
+        for total_width in 0..=(1 + width("notes") + MIN_RULE_ROOM + width("1/1") - 1) {
+            let line = &render(
+                &file(&[("a", false)]),
+                Options {
+                    total_width,
+                    height: 2,
+                    ..Options::default()
+                },
+            )[0];
+            assert!(!line.contains(RULE), "at width {total_width}: {line:?}");
+        }
     }
 
     #[test]

@@ -253,24 +253,40 @@ impl App {
         ui::split_height(self.surface, self.size.1, self.notes.len())
     }
 
-    /// Read the scratchpad off disk, once, at startup.
+    /// Read the scratchpad off disk once, before the loop starts.
+    ///
+    /// The worker keeps it current from here on, so this exists only to fill the
+    /// *first* frame. Without it the panel would appear a beat after the sidebar
+    /// opens, and since the panel's rows come out of the list, that beat is a
+    /// visible reflow rather than just a late paint.
     ///
     /// A plain file read rather than a subprocess, so invariant 4 is untouched,
     /// and it sits beside `Theme::from_tmux` in the same "resolve configuration
     /// before the loop starts" slot. A missing or unreadable file is an empty
     /// scratchpad, not an error: the first run has no file, and a panel is not
     /// worth failing to open a sidebar over.
-    ///
-    /// Keeping the panel *current* — re-stat on the poll, reparse when the
-    /// [`notes::Stamp`] moves — belongs on the worker and is not wired yet, so a
-    /// note added from elsewhere shows up the next time the sidebar opens.
-    fn load_notes(&mut self) {
-        if !self.surface.shows_notes() {
-            return;
-        }
-        if let Ok((file, _stamp)) = notes::load(&notes::path()) {
+    fn load_notes(&mut self, path: &std::path::Path) {
+        if let Ok((file, _stamp)) = notes::load(path) {
             self.notes = file;
         }
+    }
+
+    /// Take a reparsed scratchpad from a worker snapshot.
+    ///
+    /// Split from the drain in [`run`] so the "unchanged means keep what we have"
+    /// rule is testable without a worker thread — getting it backwards would blank
+    /// the panel once per interval.
+    pub fn apply_notes(&mut self, notes: Option<notes::NoteFile>) {
+        let Some(notes) = notes else {
+            return;
+        };
+        self.notes = notes;
+        // A file that shrank can leave the offset past the end. The row builder
+        // clamps for rendering, but the stored offset has to come back too, or
+        // the panel stays scrolled to nothing once notes are added again.
+        self.notes_scroll = self
+            .notes_scroll
+            .min(self.notes.len().saturating_sub(1));
     }
 
     /// The active search query, or an empty one when no search is open.
@@ -671,11 +687,18 @@ pub fn run(
 ) -> io::Result<()> {
     let size = terminal.size()?;
     let mut app = App::new(surface, tmux_pane, (size.width, size.height));
-    app.load_notes();
+    // Resolved once, here, because resolving it reads a tmux option and the
+    // worker would otherwise pay for that on every pass. `None` on a popup turns
+    // the whole watch off.
+    let notes_file = surface.shows_notes().then(notes::path);
+    if let Some(path) = &notes_file {
+        app.load_notes(path);
+    }
 
     let worker = worker::spawn(
         tmux::global_bool(tmux::CFG_AGENTS_ONLY, false),
         app.own_pane.clone(),
+        notes_file,
     );
     // Nothing to show until the first collection lands; ask for it now rather
     // than waiting out an interval.
@@ -698,6 +721,9 @@ pub fn run(
             }
             // After the tree, so the pane it names is one this snapshot listed.
             app.apply_focus(snapshot.focused);
+            // Absent on every pass where the file did not move, which is almost
+            // all of them; see `Snapshot::notes`.
+            app.apply_notes(snapshot.notes);
             received = true;
         }
 
@@ -888,6 +914,55 @@ mod tests {
         app.rebuild();
         assert!(app.notes_view.is_empty());
         assert_eq!(app.list_height(), 38, "the popup keeps every body row");
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_leaves_the_panel_alone() {
+        // `None` means "the file did not move", not "there are no notes". Reading
+        // it the other way would blank the panel once per interval — and since
+        // the panel's rows come out of the list, the whole sidebar would twitch.
+        let mut app = app_with_notes(3, 40);
+        let before = fingerprint(&app);
+        for _ in 0..3 {
+            app.apply_notes(None);
+            app.rebuild();
+        }
+        assert_eq!(app.notes.len(), 3);
+        assert_eq!(fingerprint(&app), before);
+    }
+
+    #[test]
+    fn a_snapshot_replaces_the_scratchpad_wholesale() {
+        let mut app = app_with_notes(1, 40);
+        app.apply_notes(Some(notes::NoteFile {
+            preamble: String::new(),
+            notes: vec![
+                notes::Note::new("from another pane", ""),
+                notes::Note::new("and another", ""),
+            ],
+        }));
+        app.rebuild();
+        assert_eq!(app.notes.len(), 2);
+        assert!(
+            app.notes_view.plain[1].contains("from another pane"),
+            "{:?}",
+            app.notes_view.plain
+        );
+    }
+
+    #[test]
+    fn a_scratchpad_that_shrank_pulls_the_scroll_offset_back() {
+        // Otherwise deleting notes elsewhere leaves the panel parked past the end,
+        // and it stays blank even after new notes arrive.
+        let mut app = app_with_notes(20, 40);
+        app.notes_scroll = 15;
+        app.apply_notes(Some(notes::NoteFile {
+            preamble: String::new(),
+            notes: vec![notes::Note::new("only one left", "")],
+        }));
+        app.rebuild();
+        assert_eq!(app.notes_scroll, 0);
+        assert!(app.notes_view.plain[1].contains("only one left"));
     }
 
     #[test]
