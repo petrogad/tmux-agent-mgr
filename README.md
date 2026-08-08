@@ -105,6 +105,8 @@ moving through the panes of one window is something you can see.
 | `/` | search; `Enter` keeps the filter, `Esc` clears it |
 | `R` | rename the selected window |
 | `r` | refresh now |
+| `a` | jot down a note |
+| `n` | give the notes panel the keyboard |
 | `?` | keymap |
 | `q` `Esc` | close |
 
@@ -115,6 +117,52 @@ that session first, then to the session above.
 Search matches a pane's session, window, command, git branch, worktree and agent
 name, so `ops`, `claude` and `auth` all find what you'd expect. Terms are ANDed, and
 it composes with the status filter rather than replacing it.
+
+### Notes
+
+A scratchpad at the bottom of the sidebar, for the thing you notice about *another*
+project while you're deep in this one. It is global — not per-pane, not per-session —
+because the whole point is getting something out of your head without first working
+out where it belongs.
+
+`a` opens a prompt from anywhere in the sidebar; `n` hands the panel the keyboard.
+
+| Key | | |
+|---|---|---|
+| `a` | anywhere | write a note |
+| `n` | in the list | focus the panel |
+| `j` `k` `g` `G` | in the panel | move between notes |
+| `Space` | in the panel | mark done |
+| `Enter` | in the panel | read the full note in a popup |
+| `n` `q` `Esc` | in the panel | back to the list |
+
+The panel is a mode, so `Space` marks a note done while it still jumps to a pane one
+row above. It takes at most a quarter of the sidebar and at most 12 rows, shrinks to
+however many notes you have, never leaves the pane list under 6 rows, and disappears
+entirely when the scratchpad is empty.
+
+Notes live in one markdown file — `${XDG_DATA_HOME:-~/.local/share}/tmux-agent-mgr/notes.md`,
+or wherever `@agent_mgr_notes_file` points:
+
+```markdown
+## [ ] auth redirect drops ?next
+<!-- t=1770000000 from=blueberry:3 -->
+The 302 out of /callback loses the `next` param.
+
+## [x] starship timeout
+```
+
+Markdown rather than a private format because you are not the only writer: edit it in
+`$EDITOR`, or point an agent at it. The panel notices within a second either way.
+Appends never renumber, so an agent writing while you navigate cannot move the note
+under your cursor. From a shell:
+
+```sh
+agent-mgr note add "auth redirect drops ?next"
+agent-mgr note add "check the fence case" --body -   # body on stdin
+agent-mgr note list
+agent-mgr note show 1
+```
 
 ### Reading a row
 
@@ -176,6 +224,7 @@ Set these **before** the plugin loads; it only fills in what you haven't.
 | `@agent_mgr_key_all` | `E` | prefix key toggling it everywhere |
 | `@agent_mgr_key_focus` | `o` | prefix key jumping into the sidebar and back; `none` binds nothing |
 | `@agent_mgr_key_popup` | `C-n` | prefix-less popup key; `none` binds nothing |
+| `@agent_mgr_notes_file` | *XDG default* | where the scratchpad lives; a leading `~/` is expanded |
 
 Colors take a `#RRGGBB` or a 0–255 palette index:
 `@agent_mgr_color_{accent,session,working,blocked,idle,done,error,branch}`.

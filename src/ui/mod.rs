@@ -318,6 +318,11 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     if let Some(rename) = &app.rename {
         return prompt_line("rename: ", &rename.name, total_width, theme.accent, true);
     }
+    // Above the count and the search, because it is a prompt with the keyboard
+    // and those two are only echoes of state.
+    if let Some(entry) = &app.note_entry {
+        return prompt_line("note: ", entry, total_width, theme.accent, true);
+    }
     // A half-typed count has to be visible: without an echo you cannot tell a
     // pending `1` from a keystroke that was dropped, and you find out only by
     // pressing `j` and going somewhere unexpected.

@@ -113,6 +113,12 @@ pub const CFG_AGENTS_ONLY: &str = "@agent_mgr_agents_only";
 /// Path to the global notes file. A leading `~/` is expanded; unset means the
 /// XDG default. Global rather than per-session on purpose — see [`crate::notes`].
 pub const CFG_NOTES_FILE: &str = "@agent_mgr_notes_file";
+/// Absolute path to the resolved `agent-mgr` binary, published by
+/// `tmux-agent-mgr.tmux` at load. The conf's key bindings read it, `hook.sh`
+/// reads it, and the notes overlay reads it to build the `display-popup`
+/// command — asking tmux on every use is what lets the binary be rebuilt or
+/// relocated without regenerating the agent's hook config.
+pub const CFG_BIN: &str = "@agent_mgr_bin";
 // These two are consumed only by `agent-mgr.conf` — the tab glyph is appended to
 // `window-status-format` and the nav keys are bound, both in tmux config rather
 // than in Rust. They are declared here so the option surface lives in one place,
@@ -133,11 +139,6 @@ pub mod conf_only {
     pub const CFG_KEY_FOCUS: &str = "@agent_mgr_key_focus";
     /// Prefix-less key opening the full-screen popup; `none` binds nothing.
     pub const CFG_KEY_POPUP: &str = "@agent_mgr_key_popup";
-    /// Absolute path to the resolved `agent-mgr` binary, published by
-    /// `tmux-agent-mgr.tmux` at load. The conf's key bindings read it, and so
-    /// does `hook.sh` — asking tmux on every fire is what lets the binary be
-    /// rebuilt or relocated without regenerating the agent's hook config.
-    pub const BIN: &str = "@agent_mgr_bin";
     /// Whether this tmux can host the popup surface (`display-popup -B -E`,
     /// tmux >= 3.3). Written by `tmux-agent-mgr.tmux` at load, read by the conf to
     /// decide whether binding the popup key would produce a working key or one
@@ -235,7 +236,7 @@ mod tests {
             conf_only::CFG_KEY_FOCUS,
             conf_only::CFG_KEY_POPUP,
             conf_only::HAS_POPUP,
-            conf_only::BIN,
+            CFG_BIN,
         ] {
             assert!(
                 SHIPPED_CONF.contains(key),
@@ -249,9 +250,9 @@ mod tests {
         // `hook.sh` and every key binding resolve the binary through this option,
         // so the entry point renaming it would break all three at once.
         assert!(
-            SHIPPED_TMUX.contains(conf_only::BIN),
+            SHIPPED_TMUX.contains(CFG_BIN),
             "tmux-agent-mgr.tmux must publish {}",
-            conf_only::BIN
+            CFG_BIN
         );
     }
 

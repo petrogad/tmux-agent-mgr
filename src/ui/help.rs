@@ -92,6 +92,18 @@ pub const KEYMAP: &[Binding] = &[
         token: "KeyCode::Char('r')",
     },
     Binding {
+        keys: "a",
+        description: "jot down a note",
+        token: "open_note_entry",
+    },
+    // One entry rather than four: the panel's own keys are modal, and a flat page
+    // that listed them beside the list's would imply they work in both places.
+    Binding {
+        keys: "n",
+        description: "notes panel — j/k Space Enter",
+        token: "open_notes",
+    },
+    Binding {
         keys: "?",
         description: "this help",
         token: "KeyCode::Char('?')",

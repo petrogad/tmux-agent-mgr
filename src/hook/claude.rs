@@ -618,9 +618,9 @@ mod tests {
     #[test]
     fn hook_sh_resolves_the_binary_the_way_the_plugin_publishes_it() {
         assert!(
-            SHIPPED_HOOK_SH.contains(tmux::conf_only::BIN),
+            SHIPPED_HOOK_SH.contains(tmux::CFG_BIN),
             "hook.sh should ask tmux for {} rather than guessing a path",
-            tmux::conf_only::BIN
+            tmux::CFG_BIN
         );
         assert!(
             SHIPPED_HOOK_SH.contains("hook"),

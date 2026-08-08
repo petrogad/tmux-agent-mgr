@@ -36,17 +36,6 @@
 //! Everything above the I/O section is pure, which is what lets the tests cover
 //! the format without a filesystem.
 
-#![allow(
-    dead_code,
-    reason = "the read path is live — `path`/`load`/`len` from the panel, \
-              `changed`/`Stamp::of` from the worker's watch. What is left is \
-              exactly the write path (`render`, `store`, `store_locked`, \
-              `update`, `toggle`, `is_empty`), which the panel's input mode \
-              consumes. Delete this attribute with that change; it is a \
-              module-wide allow only because `store_locked` is private and \
-              would still warn if its callers were exempted one by one"
-)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -348,9 +337,11 @@ pub fn append(text: &str, note: &Note) -> String {
 
 // ─── I/O ─────────────────────────────────────────────────────────────
 //
-// `changed`, `render`, `store` and `update` are the read/write path the sidebar
-// panel uses; the `note` subcommand below only appends. They are covered by tests
-// but have no non-test caller until the panel lands.
+// Two ways in, and both re-read inside the lock: `add` for an append, `update`
+// for anything else. There is deliberately no "write this snapshot back" entry
+// point — a caller's snapshot is always potentially stale, and handing one
+// straight to the writer is the read-modify-write race the lock exists to
+// prevent. `changed` is the cheap `stat` the sidebar's watch polls with.
 
 /// What a snapshot was read from, so the worker can tell "unchanged" from
 /// "unread" with one `stat` instead of a read and a parse.
@@ -399,15 +390,10 @@ pub fn load(path: &Path) -> io::Result<(NoteFile, Stamp)> {
     Ok((parse(&text), stamp))
 }
 
-/// Write the file back, atomically.
+/// Write the file back, atomically. The caller must already hold the lock.
 ///
 /// Temp file plus rename, so a reader never sees a half-written document and a
 /// crash mid-write cannot leave you with a truncated scratchpad.
-pub fn store(path: &Path, file: &NoteFile) -> io::Result<()> {
-    let _guard = Lock::acquire(path)?;
-    store_locked(path, file)
-}
-
 fn store_locked(path: &Path, file: &NoteFile) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

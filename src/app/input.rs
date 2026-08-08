@@ -53,6 +53,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
         search_key(key, app, ctrl);
         return;
     }
+    if app.note_entry.is_some() {
+        note_entry_key(key, app, ctrl);
+        return;
+    }
     // Help is a page, not a prompt, but it still swallows keys: any key closing it
     // means you cannot accidentally act on a list you cannot currently see.
     if app.help {
@@ -60,6 +64,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
             KeyCode::Char('c') if ctrl => app.quit = true,
             _ => app.help = false,
         }
+        return;
+    }
+
+    // The panel is a mode, not a second keymap: it wants `j`/`k` and `Space` and
+    // so does the list, and the alternative is a modified-key vocabulary for the
+    // same four motions.
+    if app.notes_focus.is_some() {
+        notes_key(key, app, ctrl);
         return;
     }
 
@@ -114,6 +126,64 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
         KeyCode::Char('R') => app.open_rename(),
         KeyCode::Char('?') => app.help = true,
         KeyCode::Char('r') => worker.request_refresh(),
+        KeyCode::Char('n') => app.open_notes(),
+        // Reachable from the list as well as the panel, because the moment you
+        // want to write something down is the moment you are reading a pane, not
+        // the moment you are already in the scratchpad.
+        KeyCode::Char('a') => app.open_note_entry(),
+        _ => {}
+    }
+}
+
+/// Keys while the notes panel has the keyboard.
+///
+/// Everything here is scoped to the panel, which is what lets `Space` mean
+/// "mark done" while it still means "jump to pane" in the list one row above.
+fn notes_key(key: KeyEvent, app: &mut App, ctrl: bool) {
+    match key.code {
+        KeyCode::Char('c') if ctrl => app.quit = true,
+        // Three ways out, all of them the ones a hand reaches for. `q` closes the
+        // sidebar from the list, so inside the panel it has to mean "leave the
+        // panel" — otherwise the mode you entered by accident costs you the pane.
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => app.close_notes(),
+        KeyCode::Char('j') | KeyCode::Down => app.move_note(1),
+        KeyCode::Char('k') | KeyCode::Up => app.move_note(-1),
+        KeyCode::Char('g') | KeyCode::Home => app.move_note(isize::MIN / 2),
+        KeyCode::Char('G') | KeyCode::End => app.move_note(isize::MAX / 2),
+        KeyCode::Char(' ') => app.toggle_selected_note(),
+        KeyCode::Char('a') => app.open_note_entry(),
+        KeyCode::Enter => app.show_note_overlay(),
+        KeyCode::Char('?') => app.help = true,
+        _ => {}
+    }
+}
+
+/// Keys while the new-note prompt is open.
+///
+/// The same short editor as the search box, for the same reason: this is one
+/// line of text you are about to commit, not a place to compose in.
+fn note_entry_key(key: KeyEvent, app: &mut App, ctrl: bool) {
+    let Some(entry) = app.note_entry.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => app.note_entry = None,
+        KeyCode::Char('c') if ctrl => app.quit = true,
+        KeyCode::Char('u') if ctrl => entry.clear(),
+        KeyCode::Char('w') if ctrl => {
+            let trimmed = entry.trim_end();
+            let cut = trimmed.rfind(char::is_whitespace).map_or(0, |at| at + 1);
+            entry.truncate(cut);
+        }
+        KeyCode::Enter => app.commit_note_entry(),
+        // Backspacing past the start abandons the prompt, so an empty box is
+        // never a mode with no visible way out — same rule as search.
+        KeyCode::Backspace => {
+            if entry.pop().is_none() {
+                app.note_entry = None;
+            }
+        }
+        KeyCode::Char(ch) if !ctrl => entry.push(ch),
         _ => {}
     }
 }
@@ -666,6 +736,211 @@ mod tests {
         let (mut app, worker) = fixture(0);
         press(&mut app, &worker, KeyCode::Char('R'));
         assert!(app.rename.is_none());
+    }
+
+    // ─── the notes panel ──────────────────────────────────────────────
+
+    /// A fixture whose scratchpad is a real file in a temp dir, because `a` and
+    /// `Space` write through `notes::add` / `notes::update` and the point of
+    /// those is that they re-read under a lock. Named per test so a parallel run
+    /// cannot have two of them on the same file.
+    fn notes_fixture(name: &str, titles: &[&str]) -> (App, Worker, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("agent-mgr-input-{name}.md"));
+        let _ = std::fs::remove_file(&path);
+        let body: String = titles
+            .iter()
+            .map(|title| format!("## [ ] {title}\n\n"))
+            .collect();
+        if !body.is_empty() {
+            std::fs::write(&path, &body).expect("write scratch notes");
+        }
+        let (mut app, worker) = fixture(3);
+        app.notes_file = Some(path.clone());
+        app.notes = crate::notes::parse(&body);
+        app.rebuild();
+        (app, worker, path)
+    }
+
+    #[test]
+    fn n_gives_the_panel_the_keyboard_and_esc_gives_it_back() {
+        let (mut app, worker, path) = notes_fixture("focus", &["one", "two"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        assert_eq!(app.notes_focus.map(|state| state.selected), Some(0));
+        press(&mut app, &worker, KeyCode::Esc);
+        assert!(app.notes_focus.is_none());
+        assert!(!app.quit, "leaving the panel must not close the sidebar");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn q_inside_the_panel_leaves_the_panel_rather_than_the_sidebar() {
+        // `q` closes the sidebar from the list, so a mode entered by accident
+        // would otherwise cost you the pane.
+        let (mut app, worker, path) = notes_fixture("q-leaves", &["one"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('q'));
+        assert!(app.notes_focus.is_none());
+        assert!(!app.quit);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn focusing_an_empty_scratchpad_does_nothing() {
+        // The panel is zero rows tall with no notes; focusing something invisible
+        // is a mode with no way to tell you are in it.
+        let (mut app, worker, _path) = notes_fixture("empty", &[]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        assert!(app.notes_focus.is_none());
+    }
+
+    #[test]
+    fn motions_in_the_panel_move_notes_and_not_the_pane_list() {
+        // The whole reason the panel is a mode: `j` has to mean two things one
+        // row apart.
+        let (mut app, worker, path) = notes_fixture("motion", &["one", "two", "three"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.notes_focus.unwrap().selected, 1);
+        assert_eq!(app.selected, 0, "the pane cursor must not have moved");
+        press(&mut app, &worker, KeyCode::Char('G'));
+        assert_eq!(app.notes_focus.unwrap().selected, 2);
+        press(&mut app, &worker, KeyCode::Char('g'));
+        assert_eq!(app.notes_focus.unwrap().selected, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_panel_cursor_saturates_instead_of_wrapping() {
+        // A cursor that jumps from the last note to the first is indistinguishable
+        // from one that lost its place.
+        let (mut app, worker, path) = notes_fixture("saturate", &["one", "two"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        for _ in 0..5 {
+            press(&mut app, &worker, KeyCode::Char('k'));
+        }
+        assert_eq!(app.notes_focus.unwrap().selected, 0);
+        for _ in 0..5 {
+            press(&mut app, &worker, KeyCode::Char('j'));
+        }
+        assert_eq!(app.notes_focus.unwrap().selected, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn space_marks_a_note_done_in_the_file_not_just_on_screen() {
+        let (mut app, worker, path) = notes_fixture("toggle", &["one", "two"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        press(&mut app, &worker, KeyCode::Char(' '));
+
+        assert!(app.notes.notes[1].done, "the snapshot updated immediately");
+        let (fresh, _) = crate::notes::load(&path).expect("reread");
+        assert!(fresh.notes[1].done, "and so did the file");
+        assert!(!fresh.notes[0].done, "and only that one");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn space_in_the_list_still_jumps_to_a_pane() {
+        // The collision the mode exists to resolve: outside the panel, Space must
+        // keep meaning what it always did.
+        let (mut app, worker, path) = notes_fixture("space-list", &["one"]);
+        app.own_pane = "%99".to_owned();
+        assert!(
+            app.activation_target().is_some(),
+            "Space in the list is still an activation, not a toggle"
+        );
+        press(&mut app, &worker, KeyCode::Char(' '));
+        assert!(!app.notes.notes[0].done, "the note must not have been touched");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_opens_a_prompt_from_the_list_without_focusing_the_panel_first() {
+        // The moment you want to write something down is the moment you are
+        // reading a pane, not the moment you are already in the scratchpad.
+        let (mut app, worker, path) = notes_fixture("add-from-list", &["one"]);
+        press(&mut app, &worker, KeyCode::Char('a'));
+        assert_eq!(app.note_entry.as_deref(), Some(""));
+        assert!(app.notes_focus.is_none());
+        type_str(&mut app, &worker, "jjk");
+        assert_eq!(
+            app.note_entry.as_deref(),
+            Some("jjk"),
+            "letters must type, not move"
+        );
+        assert_eq!(app.selected, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn committing_the_prompt_appends_to_the_file_and_lands_on_it() {
+        let (mut app, worker, path) = notes_fixture("commit", &["one"]);
+        press(&mut app, &worker, KeyCode::Char('a'));
+        type_str(&mut app, &worker, "written from the panel");
+        press(&mut app, &worker, KeyCode::Enter);
+
+        assert!(app.note_entry.is_none());
+        let (fresh, _) = crate::notes::load(&path).expect("reread");
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh.notes[1].title, "written from the panel");
+        // Appends never renumber, so the new note is the last one — and the
+        // cursor arriving on it is the confirmation the write happened.
+        assert_eq!(app.notes_focus.map(|state| state.selected), Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_blank_note_is_not_written() {
+        // An empty heading in the file reads as corruption, and there would be no
+        // way to select it in order to delete it.
+        let (mut app, _worker, path) = notes_fixture("blank", &["one"]);
+        app.note_entry = Some("   ".to_owned());
+        assert_eq!(app.take_note_entry(), None);
+        app.note_entry = Some(String::new());
+        assert_eq!(app.take_note_entry(), None);
+        app.note_entry = Some("  real  ".to_owned());
+        assert_eq!(app.take_note_entry(), Some("real".to_owned()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn backspacing_past_the_start_abandons_the_note_prompt() {
+        let (mut app, worker, path) = notes_fixture("backspace", &["one"]);
+        press(&mut app, &worker, KeyCode::Char('a'));
+        type_str(&mut app, &worker, "ab");
+        for _ in 0..3 {
+            press(&mut app, &worker, KeyCode::Backspace);
+        }
+        assert!(app.note_entry.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enter_on_a_note_returns_a_show_overlay_target_rather_than_spawning_it() {
+        // Split from the `display-popup` the way `activation_target` is split from
+        // `switch-client`: spawning one in a test run would put a popup over the
+        // developer's screen.
+        let (mut app, worker, path) = notes_fixture("overlay", &["one", "two"]);
+        assert_eq!(app.overlay_target(), None, "no target without focus");
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.overlay_target(), Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_the_panel_and_from_its_prompt() {
+        let (mut app, worker, path) = notes_fixture("ctrl-c", &["one"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press_ctrl(&mut app, &worker, 'c');
+        assert!(app.quit);
+
+        let (mut app, worker, _) = notes_fixture("ctrl-c", &["one"]);
+        press(&mut app, &worker, KeyCode::Char('a'));
+        press_ctrl(&mut app, &worker, 'c');
+        assert!(app.quit);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
