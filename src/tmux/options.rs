@@ -110,6 +110,9 @@ pub const CFG_MAX_WIDTH: &str = "@agent_mgr_max_width";
 pub const CFG_POSITION: &str = "@agent_mgr_position";
 /// When `on`, list only panes running an agent instead of every pane.
 pub const CFG_AGENTS_ONLY: &str = "@agent_mgr_agents_only";
+/// Path to the global notes file. A leading `~/` is expanded; unset means the
+/// XDG default. Global rather than per-session on purpose — see [`crate::notes`].
+pub const CFG_NOTES_FILE: &str = "@agent_mgr_notes_file";
 // These two are consumed only by `agent-mgr.conf` — the tab glyph is appended to
 // `window-status-format` and the nav keys are bound, both in tmux config rather
 // than in Rust. They are declared here so the option surface lives in one place,
@@ -224,6 +227,7 @@ mod tests {
             CFG_MAX_WIDTH,
             CFG_POSITION,
             CFG_AGENTS_ONLY,
+            CFG_NOTES_FILE,
             conf_only::CFG_TAB_STATUS,
             conf_only::CFG_NAV,
             conf_only::CFG_KEY,

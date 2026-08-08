@@ -11,6 +11,7 @@
 //! | `auto-close <window-id>` | close a window left holding only a sidebar |
 //! | `daemon [--once]` | the status poller; `--once` prints one pass and exits |
 //! | `hook <agent> <event>` | receive an agent hook payload on stdin |
+//! | `note add\|list\|show` | the global scratchpad; the surface agents write to |
 //!
 //! Keeping this in one binary is what lets `hook.sh` resolve a single path and
 //! lets the TUI re-exec itself as the daemon without a second install step.
@@ -22,6 +23,7 @@ mod git;
 mod hook;
 mod model;
 mod nav;
+mod notes;
 mod pane;
 mod preview;
 mod search;
@@ -54,6 +56,7 @@ fn main() {
         Some("auto-close") => pane::cmd_auto_close(&rest),
         Some("daemon") => daemon::cmd_daemon(&rest),
         Some("hook") => hook::cmd_hook(&rest),
+        Some("note") => notes::cmd_note(&rest),
         // The two TUI entry points. Same loop, same keymap; the surface decides
         // width, whether a preview is worth its cost, and whether jumping to a
         // pane also closes us.
