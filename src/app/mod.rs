@@ -38,6 +38,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::daemon;
 use crate::model::{AgentState, AgentStatus, SessionGroup};
+use crate::notes;
 use crate::nav::{self, Direction};
 use crate::preview::PanePreview;
 use crate::search::Query;
@@ -166,6 +167,16 @@ pub struct App {
     pub preview_lines: Vec<crate::preview::Line>,
     pub spinner: usize,
     pub list: RenderedList,
+    /// The scratchpad as last read from disk. Sized in rows by
+    /// [`ui::split_height`], so it is also what decides how tall the list is.
+    pub notes: notes::NoteFile,
+    /// The notes panel composed for the current geometry. Derived in
+    /// [`Self::rebuild`] for the same reason `preview_lines` is: it belongs to
+    /// the hashed output, not to `draw`.
+    pub notes_view: ui::notes::RenderedNotes,
+    /// First note the panel shows. Only moves once the panel takes focus, which
+    /// it cannot yet.
+    pub notes_scroll: usize,
     pub size: (u16, u16),
     /// Set to leave the loop; the pane closes with us, which is how the sidebar
     /// is dismissed from inside.
@@ -200,6 +211,13 @@ impl App {
                 plain: Vec::new(),
                 blocks: Vec::new(),
             },
+            // Deliberately empty rather than read here: `new` is what every test
+            // constructs, and loading the developer's own scratchpad would make
+            // the row split depend on what they happen to have written down.
+            // `run` fills it — see [`load_notes`].
+            notes: notes::NoteFile::default(),
+            notes_view: ui::notes::RenderedNotes::default(),
+            notes_scroll: 0,
             size,
             quit: false,
             frames: 0,
@@ -227,7 +245,32 @@ impl App {
     }
 
     pub fn list_height(&self) -> usize {
-        ui::list_height(self.size.1) as usize
+        self.rows().list as usize
+    }
+
+    /// How the pane's rows currently divide between the list and the panel.
+    fn rows(&self) -> ui::Rows {
+        ui::split_height(self.surface, self.size.1, self.notes.len())
+    }
+
+    /// Read the scratchpad off disk, once, at startup.
+    ///
+    /// A plain file read rather than a subprocess, so invariant 4 is untouched,
+    /// and it sits beside `Theme::from_tmux` in the same "resolve configuration
+    /// before the loop starts" slot. A missing or unreadable file is an empty
+    /// scratchpad, not an error: the first run has no file, and a panel is not
+    /// worth failing to open a sidebar over.
+    ///
+    /// Keeping the panel *current* — re-stat on the poll, reparse when the
+    /// [`notes::Stamp`] moves — belongs on the worker and is not wired yet, so a
+    /// note added from elsewhere shows up the next time the sidebar opens.
+    fn load_notes(&mut self) {
+        if !self.surface.shows_notes() {
+            return;
+        }
+        if let Ok((file, _stamp)) = notes::load(&notes::path()) {
+            self.notes = file;
+        }
     }
 
     /// The active search query, or an empty one when no search is open.
@@ -282,6 +325,26 @@ impl App {
         self.clamp_scroll();
         self.counts = Counts::tally(&self.sessions);
         self.compose_preview();
+        self.compose_notes();
+    }
+
+    /// Re-compose the notes panel for the current geometry.
+    ///
+    /// Here rather than in `draw` so the panel's text is part of what the loop
+    /// hashes — a note appearing is a reason to repaint, and this is how the
+    /// loop finds out.
+    fn compose_notes(&mut self) {
+        self.notes_view = ui::notes::build(
+            &self.notes,
+            &ui::notes::Options {
+                total_width: ui::split_width(self.surface, self.size.0).0 as usize,
+                height: self.rows().notes as usize,
+                scroll: self.notes_scroll,
+                // No focus model yet, so the panel never draws a cursor.
+                selected: None,
+            },
+            &self.theme,
+        );
     }
 
     /// Take in where tmux focus now is, moving the cursor if it moved.
@@ -594,6 +657,9 @@ fn fingerprint(app: &App) -> u64 {
     // Pane content changing behind the preview is a real reason to redraw, and
     // hashing the composed lines is how the loop learns about it.
     app.preview_lines.hash(&mut hasher);
+    // The panel is part of the screen, and a note added from another pane is
+    // exactly the kind of change the loop exists to notice.
+    app.notes_view.plain.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -605,6 +671,7 @@ pub fn run(
 ) -> io::Result<()> {
     let size = terminal.size()?;
     let mut app = App::new(surface, tmux_pane, (size.width, size.height));
+    app.load_notes();
 
     let worker = worker::spawn(
         tmux::global_bool(tmux::CFG_AGENTS_ONLY, false),
@@ -756,6 +823,94 @@ mod tests {
         app.sessions = tree(panes);
         app.rebuild();
         app
+    }
+
+    /// An app with `count` notes in its scratchpad, rendered.
+    fn app_with_notes(count: usize, height: u16) -> App {
+        let mut app = app_with(vec![pane("%1", AgentState::Idle, true)], height);
+        app.notes = notes::NoteFile {
+            preamble: String::new(),
+            notes: (0..count)
+                .map(|index| notes::Note::new(&format!("note {index}"), ""))
+                .collect(),
+        };
+        app.rebuild();
+        app
+    }
+
+    // ─── notes panel ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_freshly_built_app_has_no_notes_of_its_own() {
+        // `new` must not read the developer's scratchpad, or every layout test in
+        // this file would depend on what they had written down that day.
+        let app = app_with(vec![pane("%1", AgentState::Idle, true)], 40);
+        assert!(app.notes.is_empty());
+        assert!(app.notes_view.is_empty());
+    }
+
+    #[test]
+    fn the_panel_takes_its_rows_out_of_the_list() {
+        let without = app_with_notes(0, 40).list_height();
+        let with = app_with_notes(3, 40).list_height();
+        assert_eq!(with, without - 4, "a header and three notes");
+    }
+
+    #[test]
+    fn the_composed_panel_is_exactly_as_tall_as_the_rows_it_was_given() {
+        // The rect and the lines are sized by the same call; if they can
+        // disagree, the panel either clips its last note or paints over the
+        // footer.
+        for count in [0usize, 1, 3, 40] {
+            for height in [10u16, 24, 40, 80] {
+                let app = app_with_notes(count, height);
+                let rows = ui::split_height(Surface::Sidebar, height, count);
+                assert_eq!(
+                    app.notes_view.lines.len(),
+                    rows.notes as usize,
+                    "{count} notes in {height} rows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_popup_composes_no_panel_however_many_notes_are_waiting() {
+        let mut app = surfaced_app(
+            Surface::Popup,
+            vec![pane("%1", AgentState::Idle, true)],
+            40,
+        );
+        app.notes = notes::NoteFile {
+            preamble: String::new(),
+            notes: (0..5).map(|_| notes::Note::new("x", "")).collect(),
+        };
+        app.rebuild();
+        assert!(app.notes_view.is_empty());
+        assert_eq!(app.list_height(), 38, "the popup keeps every body row");
+    }
+
+    #[test]
+    fn fingerprint_moves_when_a_note_appears() {
+        // Otherwise the loop's change test cannot see the panel, and a note
+        // written from another pane never gets painted.
+        let mut app = app_with_notes(1, 40);
+        let before = fingerprint(&app);
+        app.notes.notes.push(notes::Note::new("something new", ""));
+        app.rebuild();
+        assert_ne!(fingerprint(&app), before);
+    }
+
+    #[test]
+    fn fingerprint_is_stable_while_the_scratchpad_is_untouched() {
+        // The zero-frames-when-idle promise: re-reading the same notes must not
+        // produce a new frame.
+        let mut app = app_with_notes(3, 40);
+        let first = fingerprint(&app);
+        for _ in 0..5 {
+            app.rebuild();
+            assert_eq!(fingerprint(&app), first);
+        }
     }
 
     // ─── filter ───────────────────────────────────────────────────────

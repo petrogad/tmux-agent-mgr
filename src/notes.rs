@@ -38,8 +38,10 @@
 
 #![allow(
     dead_code,
-    reason = "the read/write path is consumed by the sidebar panel, landing next; \
-              remove this attribute with that change"
+    reason = "the panel reads (`path`, `load`, `len`); what is still uncalled is \
+              the reload path (`changed`) and the write path (`render`, `store`, \
+              `update`, `toggle`, `is_empty`), which the worker and the panel's \
+              input mode consume. Remove this attribute with that change"
 )]
 
 use std::fs::{self, File, OpenOptions};
