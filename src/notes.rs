@@ -18,9 +18,20 @@
 //! <!-- t=2026-08-08T14:22:03Z from=blueberry:3 -->
 //! The 302 out of /callback loses the `next` param.
 //!
+//! ### Repro
+//!
+//! 1. log out
+//! 2. hit a protected route
+//!
 //! ## [x] starship timeout
 //! Raised to 1500ms.
 //! ```
+//!
+//! A note is an `h2`, so **its body's own sections are `h3` and deeper**. That is
+//! ordinary markdown nesting rather than a rule we invented, and it is the one
+//! thing worth knowing before writing a long note: a bare `## ` at the start of a
+//! line begins the *next note*, wherever it appears. Inside a fence it is safe —
+//! notes are mostly about code, so that is the common case, not an exotic one.
 //!
 //! Two properties the rest of the feature leans on:
 //!
@@ -318,6 +329,39 @@ fn block(note: &Note) -> String {
     out
 }
 
+/// Replace note `index` with whatever its edited markdown parsed to.
+///
+/// Deliberately forgiving in all three directions, because the text came back
+/// from a human in an editor and the only unrecoverable outcome here is losing
+/// something they typed:
+///
+/// - **Blank** deletes the note. Clearing a note out to be rid of it is the
+///   obvious gesture, and it is the only delete this TUI has.
+/// - **No heading** keeps the original title and metadata and takes the whole
+///   text as the body. Someone editing a body and clobbering the `## ` line
+///   should not lose the note over a typo.
+/// - **Several headings** splices them all in. Splitting one note into two by
+///   typing a second heading is a reasonable thing to mean.
+pub fn splice(file: &mut NoteFile, index: usize, edited: &str) {
+    let Some(original) = file.notes.get(index).cloned() else {
+        return;
+    };
+    if edited.trim().is_empty() {
+        file.notes.remove(index);
+        return;
+    }
+    let parsed = parse(edited);
+    let replacement = if parsed.notes.is_empty() {
+        vec![Note {
+            body: edited.trim_end().to_owned(),
+            ..original
+        }]
+    } else {
+        parsed.notes
+    };
+    file.notes.splice(index..=index, replacement);
+}
+
 /// Append a note to raw file text.
 ///
 /// Takes and returns raw text rather than a [`NoteFile`] on purpose: an append is
@@ -533,8 +577,9 @@ pub fn cmd_note(args: &[&str]) -> i32 {
         Some("add") => cmd_add(&args[1..]),
         Some("list") => cmd_list(),
         Some("show") => cmd_show(&args[1..]),
+        Some("edit") => cmd_edit(&args[1..]),
         other => {
-            eprintln!("agent-mgr note: expected add|list|show, got {other:?}");
+            eprintln!("agent-mgr note: expected add|list|show|edit, got {other:?}");
             2
         }
     }
@@ -647,6 +692,94 @@ fn cmd_show(args: &[&str]) -> i32 {
         None => println!("note {index} is no longer there"),
     }
     0
+}
+
+/// Open one note in `$EDITOR` and write back whatever comes out.
+///
+/// A subcommand rather than something the TUI does itself, because the TUI
+/// cannot wait: `display-popup` runs on the attached client and the `tmux`
+/// process we spawn returns immediately, so there is no moment at which the
+/// sidebar could read the result back. Doing the whole round trip out here
+/// means the popup owns it start to finish, the file changes, and the sidebar's
+/// watch notices within a second like any other write.
+///
+/// It is also just useful on its own: `agent-mgr note edit 2` from any shell.
+fn cmd_edit(args: &[&str]) -> i32 {
+    let Some(index) = args.first().and_then(|raw| raw.parse::<usize>().ok()) else {
+        eprintln!("agent-mgr note edit: expected a note index");
+        return 2;
+    };
+    let notes = path();
+    let (file, _) = match load(&notes) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("agent-mgr note edit: {err}");
+            return 1;
+        }
+    };
+    let Some(note) = file.notes.get(index) else {
+        eprintln!("agent-mgr note edit: note {index} is no longer there");
+        return 1;
+    };
+
+    // A `.md` name so the editor picks the right syntax — the whole point of the
+    // format being markdown is that the tools you already have understand it.
+    let scratch = std::env::temp_dir().join(format!(
+        "agent-mgr-note-{index}-{}.md",
+        std::process::id()
+    ));
+    if let Err(err) = fs::write(&scratch, block(note)) {
+        eprintln!("agent-mgr note edit: {err}");
+        return 1;
+    }
+
+    let outcome = run_editor(&scratch);
+    let edited = fs::read_to_string(&scratch);
+    let _ = fs::remove_file(&scratch);
+
+    match outcome {
+        Ok(status) if !status.success() => {
+            // A non-zero editor is an abandoned edit, not a mangled note.
+            eprintln!("agent-mgr note edit: editor exited {status}, leaving the note alone");
+            return 1;
+        }
+        Err(err) => {
+            eprintln!("agent-mgr note edit: {err}");
+            return 1;
+        }
+        Ok(_) => {}
+    }
+    let Ok(edited) = edited else {
+        eprintln!("agent-mgr note edit: could not read the edited note back");
+        return 1;
+    };
+
+    // Through `update`, so the merge happens under the lock against whatever the
+    // file says now — an agent may well have appended while the editor was open.
+    // Appends never renumber, so `index` still means the same note.
+    if let Err(err) = update(&notes, |file| splice(file, index, &edited)) {
+        eprintln!("agent-mgr note edit: {err}");
+        return 1;
+    }
+    0
+}
+
+/// Run the user's editor on one file, inheriting the terminal.
+///
+/// Through `sh -c` because `$EDITOR` is a command line, not a program — `code -w`
+/// and `nvim -u NONE` both have to work. The path goes in as `$1` rather than
+/// being interpolated into the string, so a temp dir with a space in it is not a
+/// syntax error.
+fn run_editor(file: &Path) -> io::Result<std::process::ExitStatus> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_owned());
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(file)
+        .status()
 }
 
 #[cfg(test)]
@@ -934,6 +1067,87 @@ mod tests {
 
         assert_eq!(titles(&after), ["first", "second"], "append survived");
         assert!(after.notes[0].done);
+    }
+
+    // ─── editing one note ─────────────────────────────────────────────
+
+    fn three_notes() -> NoteFile {
+        parse("## [ ] one\nbody one\n\n## [x] two\n\n## [ ] three\n")
+    }
+
+    #[test]
+    fn editing_a_note_replaces_only_that_note() {
+        let mut file = three_notes();
+        splice(&mut file, 1, "## [ ] two, rewritten\nwith a body now\n");
+        assert_eq!(file.len(), 3);
+        assert_eq!(file.notes[1].title, "two, rewritten");
+        assert_eq!(file.notes[1].body, "with a body now");
+        assert!(!file.notes[1].done, "the edited checkbox wins");
+        // Neighbours untouched, bodies included.
+        assert_eq!(file.notes[0].title, "one");
+        assert_eq!(file.notes[0].body, "body one");
+        assert_eq!(file.notes[2].title, "three");
+    }
+
+    #[test]
+    fn clearing_a_note_out_deletes_it() {
+        // The only delete this TUI has, and the obvious gesture for it.
+        for emptied in ["", "   ", "\n\n\t\n"] {
+            let mut file = three_notes();
+            splice(&mut file, 1, emptied);
+            assert_eq!(file.len(), 2, "on {emptied:?}");
+            assert_eq!(file.notes[0].title, "one");
+            assert_eq!(file.notes[1].title, "three");
+        }
+    }
+
+    #[test]
+    fn losing_the_heading_keeps_the_title_and_takes_the_rest_as_body() {
+        // Somebody editing a body should not lose the note by clobbering the
+        // `## ` line. Nothing they typed is discarded either way.
+        let mut file = three_notes();
+        splice(&mut file, 0, "just some prose\nover two lines\n");
+        assert_eq!(file.len(), 3);
+        assert_eq!(file.notes[0].title, "one", "the original title survives");
+        assert_eq!(file.notes[0].body, "just some prose\nover two lines");
+    }
+
+    #[test]
+    fn a_second_heading_splits_the_note_in_two() {
+        let mut file = three_notes();
+        splice(&mut file, 0, "## [ ] first half\n\n## [x] second half\n");
+        assert_eq!(file.len(), 4);
+        assert_eq!(file.notes[0].title, "first half");
+        assert_eq!(file.notes[1].title, "second half");
+        assert!(file.notes[1].done);
+        assert_eq!(file.notes[2].title, "two", "the rest shifted, not vanished");
+    }
+
+    #[test]
+    fn editing_a_note_that_is_gone_changes_nothing() {
+        // The index came from a sidebar cursor, and the file may have been
+        // rewritten while the editor was open.
+        let mut file = three_notes();
+        splice(&mut file, 9, "## [ ] from nowhere\n");
+        assert_eq!(file, three_notes());
+    }
+
+    #[test]
+    fn an_edit_preserves_the_metadata_line_it_was_handed_back() {
+        // `block` writes the `<!-- t=… -->` line into the scratch file, so a
+        // round trip through the editor has to bring it home again — that line is
+        // where a note remembers when and where it came from.
+        let mut file = parse("## [ ] one\n<!-- t=1700 from=work:2 -->\nbody\n");
+        let round_tripped = block(&file.notes[0]);
+        splice(&mut file, 0, &round_tripped);
+        assert_eq!(
+            file.notes[0].meta,
+            vec![
+                ("t".to_owned(), "1700".to_owned()),
+                ("from".to_owned(), "work:2".to_owned())
+            ]
+        );
+        assert_eq!(file.notes[0].body, "body");
     }
 
     #[test]

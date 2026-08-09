@@ -426,36 +426,47 @@ impl App {
         (selected < self.notes.len()).then_some(selected)
     }
 
-    /// Open the note under the cursor in a popup, full body and all.
+    /// Read the note under the cursor in a popup, full body and all.
     ///
-    /// `display-popup` rather than a pane split, and a pager rather than a bare
-    /// `cat`, because a body can be longer than the popup and a note you cannot
-    /// scroll is a note you cannot read. Needs tmux >= 3.3, same as the existing
-    /// full-screen popup.
+    /// A pager rather than a bare `cat`, because a body can be longer than the
+    /// popup and a note you cannot scroll is a note you cannot read.
     pub fn show_note_overlay(&self) {
-        let (Some(index), Some(bin)) = (self.overlay_target(), tmux::global(tmux::CFG_BIN)) else {
+        let Some(index) = self.overlay_target() else {
             return;
         };
-        // Everything interpolated is quoted: the binary path is user-supplied via
-        // @agent_mgr_bin, and this string is handed to a shell.
-        let command = format!(
-            "{} note show {index} | ${{PAGER:-less -R}}",
-            sh_quote(&bin)
-        );
-        // Bordered, unlike the full-screen popup which drops the border with -B:
-        // this one floats over your work at the right edge, and the border is what
-        // separates the note from whatever is behind it.
-        tmux::run_tmux_quiet(&[
-            "display-popup",
-            "-E",
-            "-w",
-            "45%",
-            "-h",
-            "60%",
-            "-x",
-            "R",
-            &command,
-        ]);
+        self.note_popup(&format!("note show {index} | ${{PAGER:-less -R}}"));
+    }
+
+    /// Open the note under the cursor in `$EDITOR`.
+    ///
+    /// The whole round trip — extract, edit, merge back under the lock — lives in
+    /// `agent-mgr note edit`, not here. `display-popup` runs on the attached
+    /// client and the `tmux` process we spawn returns immediately, so there is no
+    /// moment at which this function could read the result back. Letting the
+    /// popup own it means the file changes and our own watch notices, exactly as
+    /// it would for an edit made anywhere else.
+    pub fn edit_note_overlay(&self) {
+        let Some(index) = self.overlay_target() else {
+            return;
+        };
+        self.note_popup(&format!("note edit {index}"));
+    }
+
+    /// Run an `agent-mgr note …` subcommand in a popup over the whole window.
+    ///
+    /// Centred, which is tmux's default when no `-x`/`-y` is given: this is a
+    /// thing you stop and read or write, not a side panel to glance at, and it
+    /// should sit on top of everything rather than off in a corner. Bordered too,
+    /// unlike the full-screen popup which passes `-B` — the border is what
+    /// separates it from the work behind it. Needs tmux >= 3.3, same as that one.
+    fn note_popup(&self, subcommand: &str) {
+        let Some(bin) = tmux::global(tmux::CFG_BIN) else {
+            return;
+        };
+        // The binary path is user-supplied through @agent_mgr_bin and this string
+        // is handed to a shell, so it is quoted rather than interpolated bare.
+        let command = format!("{} {subcommand}", sh_quote(&bin));
+        tmux::run_tmux_quiet(&["display-popup", "-E", "-w", "70%", "-h", "70%", &command]);
     }
 
     /// Take a reparsed scratchpad from a worker snapshot.

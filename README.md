@@ -134,7 +134,12 @@ out where it belongs.
 | `j` `k` `g` `G` | in the panel | move between notes |
 | `Space` | in the panel | mark done |
 | `Enter` | in the panel | read the full note in a popup |
+| `e` | in the panel | open the note in `$EDITOR` |
 | `n` `q` `Esc` | in the panel | back to the list |
+
+`a` is for getting a title down fast; `e` is where the body gets written, in your
+own editor, in the markdown the file is already made of. Both popups are centred
+over the window. Emptying a note in the editor and saving is how you delete it.
 
 The panel is a mode, so `Space` marks a note done while it still jumps to a pane one
 row above. It takes at most a quarter of the sidebar and at most 12 rows, shrinks to
@@ -144,13 +149,29 @@ entirely when the scratchpad is empty.
 Notes live in one markdown file — `${XDG_DATA_HOME:-~/.local/share}/tmux-agent-mgr/notes.md`,
 or wherever `@agent_mgr_notes_file` points:
 
-```markdown
+````markdown
 ## [ ] auth redirect drops ?next
 <!-- t=1770000000 from=blueberry:3 -->
 The 302 out of /callback loses the `next` param.
 
-## [x] starship timeout
+### Repro
+
+1. log out
+2. hit a protected route
+3. land on `/` instead
+
+```sh
+curl -i localhost:3000/callback
 ```
+
+## [x] starship timeout
+Raised to 1500ms.
+````
+
+The sidebar shows titles; everything under one is its body, and `Enter` is how you
+read it. **A note is an `h2`, so its own sections are `h3` and deeper** — a bare `## `
+at the start of a line starts the next note, wherever it appears. Inside a fenced
+code block it is safe.
 
 Markdown rather than a private format because you are not the only writer: edit it in
 `$EDITOR`, or point an agent at it. The panel notices within a second either way.
@@ -162,6 +183,7 @@ agent-mgr note add "auth redirect drops ?next"
 agent-mgr note add "check the fence case" --body -   # body on stdin
 agent-mgr note list
 agent-mgr note show 1
+agent-mgr note edit 1      # $EDITOR; this is what `e` runs in the popup
 ```
 
 ### Reading a row

@@ -153,6 +153,9 @@ fn notes_key(key: KeyEvent, app: &mut App, ctrl: bool) {
         KeyCode::Char(' ') => app.toggle_selected_note(),
         KeyCode::Char('a') => app.open_note_entry(),
         KeyCode::Enter => app.show_note_overlay(),
+        // `a` gets the title down fast; `e` is where the body gets written, in a
+        // real editor, in the markdown the file is already made of.
+        KeyCode::Char('e') => app.edit_note_overlay(),
         KeyCode::Char('?') => app.help = true,
         _ => {}
     }

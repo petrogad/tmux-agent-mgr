@@ -100,7 +100,7 @@ pub const KEYMAP: &[Binding] = &[
     // that listed them beside the list's would imply they work in both places.
     Binding {
         keys: "n",
-        description: "notes panel — j/k Space Enter",
+        description: "notes — j/k Space Enter e",
         token: "open_notes",
     },
     Binding {
