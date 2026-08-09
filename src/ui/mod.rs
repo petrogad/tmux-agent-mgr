@@ -306,6 +306,24 @@ fn filter_label(filter: StatusFilter) -> &'static str {
     }
 }
 
+/// The footer as plain text, for tests that care what actually reached the
+/// screen rather than what was merely computed.
+///
+/// Several things compete for this one line, and only the first match renders.
+/// Asserting on the state behind them cannot tell a message that is shown from
+/// one that is shadowed by a prompt above it — which is exactly how a failed
+/// write once set an error nobody ever saw.
+#[cfg(test)]
+pub fn footer_text(app: &App, total_width: usize) -> String {
+    footer_line(app, total_width)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
 /// The footer carries the active filter and, when it is hiding panes, how many.
 /// A filter you forgot you set is the classic "why is my agent missing" bug.
 fn footer_line(app: &App, total_width: usize) -> Line<'static> {
@@ -320,13 +338,19 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     }
     // Above the count and the search, because it is a prompt with the keyboard
     // and those two are only echoes of state.
+    // Above the prompts, not below them. A failed write restores the entry
+    // prompt *and* sets this, so an error checked second is an error the user
+    // never sees — it is cleared by the next key having only ever been computed.
+    if let Some(error) = &app.note_error {
+        return prompt_line("", error, total_width, theme.error, false);
+    }
     if let Some(entry) = &app.note_entry {
         return prompt_line("note: ", entry, total_width, theme.accent, true);
     }
     // Named, so you are not answering a bare "delete? y/n" and having to look
     // back up at the cursor to work out what about. In the error colour because
     // it is the one action here with no undo.
-    if let Some((_, note)) = &app.note_delete {
+    if let Some(note) = &app.note_delete {
         return prompt_line(
             "delete ",
             &format!("{:?}? y/n", note.title),
@@ -334,11 +358,6 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
             theme.error,
             false,
         );
-    }
-    // Below the prompts, above everything that merely echoes state: a failed
-    // write is the most important thing the footer can be saying.
-    if let Some(error) = &app.note_error {
-        return prompt_line("", error, total_width, theme.error, false);
     }
     // A half-typed count has to be visible: without an echo you cannot tell a
     // pending `1` from a keystroke that was dropped, and you find out only by

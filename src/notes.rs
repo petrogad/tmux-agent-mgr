@@ -87,15 +87,66 @@ impl Note {
         }
     }
 
-    /// Whether this is the same note as `other`, for re-resolving a stale index.
+    /// This note's immutable identity, if it has one.
     ///
-    /// Title and metadata, not the body and not the checkbox: the origin stamp is
-    /// effectively an identity because it carries the epoch second the note was
-    /// taken, while the body and the done flag are exactly the things a
-    /// concurrent edit or toggle is *allowed* to have changed underneath us.
-    pub fn is_same_as(&self, other: &Self) -> bool {
-        self.title == other.title && self.meta == other.meta
+    /// Every note written since ids landed carries one, and [`update`] backfills
+    /// the rest, so a file converges on all-identified after a single mutation.
+    pub fn id(&self) -> Option<&str> {
+        self.meta
+            .iter()
+            .find(|(key, _)| key == ID_KEY)
+            .map(|(_, value)| value.as_str())
     }
+
+    /// Whether this *could* be the same note as `other`.
+    ///
+    /// Only ever a candidate test — [`NoteFile::locate`] is what decides, because
+    /// this is not guaranteed unique. Two hand-written notes with the same title
+    /// and no metadata compare equal here, and so do two notes added in the same
+    /// second from the same window before ids existed.
+    ///
+    /// Title and metadata, not the body and not the checkbox: the body and the
+    /// done flag are exactly what a concurrent edit or toggle is *allowed* to
+    /// have changed underneath us.
+    fn looks_like(&self, other: &Self) -> bool {
+        match (self.id(), other.id()) {
+            // An id settles it outright; nothing else is even consulted.
+            (Some(mine), Some(theirs)) => mine == theirs,
+            // One side identified and the other not is two different notes, or
+            // the same note across a backfill — either way, not a safe match.
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => self.title == other.title && self.meta == other.meta,
+        }
+    }
+}
+
+/// Metadata key holding a note's immutable id.
+pub const ID_KEY: &str = "id";
+
+/// A fresh note id.
+///
+/// Clock nanoseconds and the pid, base-36. Not a UUID and not trying to be:
+/// colliding needs two notes created in the same nanosecond by the same process,
+/// and the only thing an id has to survive is other notes moving around it.
+fn new_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("{}{}", base36(nanos), base36(u128::from(std::process::id())))
+}
+
+fn base36(mut value: u128) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut out = Vec::new();
+    while value > 0 {
+        out.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// A parsed notes file.
@@ -117,27 +168,67 @@ impl NoteFile {
         self.notes.len()
     }
 
-    /// Flip a note's done flag. Out-of-range is a no-op rather than a panic: the
-    /// index comes from a selection that a concurrent write may have shortened.
-    pub fn toggle(&mut self, index: usize) {
-        if let Some(note) = self.notes.get_mut(index) {
-            note.done = !note.done;
+    /// Where `expect` lives now, or `None` if that cannot be answered safely.
+    ///
+    /// **Every mutation resolves through this, and no mutation trusts an index.**
+    /// An index is captured when a key is pressed and used after a popup, an
+    /// editor session, or a `y/n` prompt; deletion renumbers; and a sidebar in
+    /// every window is the normal configuration here. So the index is not even
+    /// taken as a hint — a note that moved is found where it went, and a note
+    /// that cannot be told apart from another is not found at all.
+    ///
+    /// `None` covers both "it is gone" and "there are two of it". Refusing an
+    /// ambiguous match is the whole point: with two identical hand-written notes
+    /// and a deletion above them, guessing has a fifty-fifty chance of destroying
+    /// the wrong one, and declining costs only a keystroke.
+    pub fn locate(&self, expect: &Note) -> Option<usize> {
+        let mut found = None;
+        for (index, note) in self.notes.iter().enumerate() {
+            if !note.looks_like(expect) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index);
         }
+        found
     }
 
-    /// Drop note `index`, but only if it is still the note `expect` describes.
+    /// Drop the note `expect` describes, wherever it now sits.
     ///
-    /// The one operation that renumbers, which is why identity is checked rather
-    /// than trusting the index: a second sidebar deleting an earlier note shifts
-    /// everything below it, and a `y` answered about one title must never remove
-    /// a different one. Returns whether it removed anything.
+    /// Returns whether it removed anything; `false` means gone or ambiguous.
     #[must_use]
-    pub fn remove_matching(&mut self, index: usize, expect: &Note) -> bool {
-        if !self.notes.get(index).is_some_and(|note| note.is_same_as(expect)) {
+    pub fn remove_note(&mut self, expect: &Note) -> bool {
+        let Some(index) = self.locate(expect) else {
             return false;
-        }
+        };
         self.notes.remove(index);
         true
+    }
+
+    /// Flip the done flag on the note `expect` describes.
+    #[must_use]
+    pub fn toggle_note(&mut self, expect: &Note) -> bool {
+        let Some(index) = self.locate(expect) else {
+            return false;
+        };
+        self.notes[index].done = !self.notes[index].done;
+        true
+    }
+
+    /// Give every note an id that lacks one.
+    ///
+    /// Called on the way out of [`update`], so a file written by hand or by an
+    /// older build converges on all-identified after a single mutation and the
+    /// ambiguous-match case stops existing for it. Notes that already have an id
+    /// keep it — an id is immutable, or it is not an identity.
+    fn backfill_ids(&mut self) {
+        for note in &mut self.notes {
+            if note.id().is_none() {
+                note.meta.insert(0, (ID_KEY.to_owned(), new_id()));
+            }
+        }
     }
 }
 
@@ -384,19 +475,17 @@ fn block(note: &Note) -> String {
 ///   format, and moving it a line down is the only outcome that keeps every
 ///   character the user typed.
 ///
-/// Returns `false` without touching anything when `index` no longer holds the
-/// note `expect` describes. The index was resolved when the editor opened and
-/// this runs after it closed; another sidebar deleting an earlier note in between
-/// renumbers everything after it, and writing an edit over an unrelated note is
-/// far worse than declining to write it at all.
+/// Returns `false` without touching anything when [`NoteFile::locate`] cannot
+/// place `expect` — it is gone, or it cannot be told apart from another note.
+/// The identity was captured before the editor opened and this runs after it
+/// closed, which is a long time for the file to change underneath; writing an
+/// edit over an unrelated note is far worse than declining to write it at all.
 #[must_use]
-pub fn splice(file: &mut NoteFile, index: usize, expect: &Note, edited: &str) -> bool {
-    let Some(original) = file.notes.get(index).cloned() else {
+pub fn splice(file: &mut NoteFile, expect: &Note, edited: &str) -> bool {
+    let Some(index) = file.locate(expect) else {
         return false;
     };
-    if !original.is_same_as(expect) {
-        return false;
-    }
+    let original = file.notes[index].clone();
     if edited.trim().is_empty() {
         file.notes.remove(index);
         return true;
@@ -558,6 +647,12 @@ where
     };
     let mut file = parse(&text);
     mutate(&mut file);
+    // After the mutation, not before. The caller's expected identity was read
+    // from this file as it was, so on a legacy note it carries no id; backfilling
+    // first would give the stored note one, and `looks_like` treats identified
+    // and unidentified as different notes. So the first mutation resolves the old
+    // way and writes the ids, and everything after it resolves by id.
+    file.backfill_ids();
     store_locked(path, &file)?;
     Ok(file)
 }
@@ -752,7 +847,6 @@ fn cmd_list() -> i32 {
 
 /// Print one note as markdown. This is what the detail overlay runs.
 fn cmd_show(args: &[&str]) -> i32 {
-    let mut index: Option<usize> = None;
     let mut color = crate::highlight::When::default();
     for arg in args {
         if let Some(value) = arg.strip_prefix("--color=") {
@@ -761,15 +855,10 @@ fn cmd_show(args: &[&str]) -> i32 {
                 return 2;
             };
             color = parsed;
-        } else if let Ok(parsed) = arg.parse::<usize>() {
-            index = Some(parsed);
-        } else {
-            eprintln!("agent-mgr note show: unexpected argument {arg:?}");
-            return 2;
         }
     }
-    let Some(index) = index else {
-        eprintln!("agent-mgr note show: expected a note index");
+    let Some(target) = Target::parse(args) else {
+        eprintln!("agent-mgr note show: expected a note index or --id=<id>");
         return 2;
     };
     let (file, _) = match load(&path()) {
@@ -782,8 +871,8 @@ fn cmd_show(args: &[&str]) -> i32 {
     // Out of range is not an error worth a non-zero exit: the file may have been
     // edited between the keypress and the popup opening, and a popup that reports
     // a failure is worse than one that says the note is gone.
-    match file.notes.get(index) {
-        Some(note) => {
+    match target.resolve(&file).ok() {
+        Some((_, note)) => {
             // The theme is only worth a handful of tmux reads once we know there
             // is something to paint, and only when we are going to paint it.
             let enabled = color.enabled(std::io::stdout().is_terminal());
@@ -794,9 +883,63 @@ fn cmd_show(args: &[&str]) -> i32 {
             };
             print!("{}", crate::highlight::note(&block(note), &theme, enabled));
         }
-        None => println!("note {index} is no longer there"),
+        // Not an error worth a non-zero exit: the file may have been edited
+        // between the keypress and the popup opening, and a popup that reports a
+        // failure is worse than one that says the note is gone.
+        None => println!("that note is no longer there"),
     }
     0
+}
+
+/// How a subcommand was told which note to act on.
+///
+/// The sidebar sends `--id=` whenever it can, because an index is only true at
+/// the instant it is read: between the keypress and the popup actually launching,
+/// another pane can delete an earlier note and shift everything below it. An
+/// index would then open — and later overwrite — a note nobody asked for.
+///
+/// A bare index stays supported for people typing `note edit 2` at a shell, where
+/// the number they just read from `note list` is exactly what they mean.
+enum Target {
+    Id(String),
+    Index(usize),
+}
+
+impl Target {
+    /// Pull a target out of an argument list, ignoring flags it does not own.
+    fn parse(args: &[&str]) -> Option<Self> {
+        let mut found = None;
+        for arg in args {
+            if let Some(id) = arg.strip_prefix("--id=") {
+                // An explicit id always wins over a positional index.
+                return Some(Self::Id(id.to_owned()));
+            }
+            if let Ok(index) = arg.parse::<usize>() {
+                found = Some(Self::Index(index));
+            }
+        }
+        found
+    }
+
+    /// Find the note, or say why not in a sentence fit for a popup.
+    fn resolve<'a>(&self, file: &'a NoteFile) -> Result<(usize, &'a Note), String> {
+        let index = match self {
+            Self::Index(index) => *index,
+            Self::Id(id) => {
+                let probe = Note {
+                    meta: vec![(ID_KEY.to_owned(), id.clone())],
+                    ..Note::default()
+                };
+                file.locate(&probe).ok_or_else(|| {
+                    "that note is no longer there — something else deleted it".to_owned()
+                })?
+            }
+        };
+        file.notes
+            .get(index)
+            .map(|note| (index, note))
+            .ok_or_else(|| format!("note {index} is no longer there"))
+    }
 }
 
 /// Open one note in `$EDITOR` and write back whatever comes out.
@@ -810,8 +953,8 @@ fn cmd_show(args: &[&str]) -> i32 {
 ///
 /// It is also just useful on its own: `agent-mgr note edit 2` from any shell.
 fn cmd_edit(args: &[&str]) -> i32 {
-    let Some(index) = args.first().and_then(|raw| raw.parse::<usize>().ok()) else {
-        eprintln!("agent-mgr note edit: expected a note index");
+    let Some(target) = Target::parse(args) else {
+        eprintln!("agent-mgr note edit: expected a note index or --id=<id>");
         return 2;
     };
     let notes = path();
@@ -822,9 +965,12 @@ fn cmd_edit(args: &[&str]) -> i32 {
             return 1;
         }
     };
-    let Some(note) = file.notes.get(index) else {
-        eprintln!("agent-mgr note edit: note {index} is no longer there");
-        return 1;
+    let (index, note) = match target.resolve(&file) {
+        Ok(found) => found,
+        Err(reason) => {
+            eprintln!("agent-mgr note edit: {reason}");
+            return 1;
+        }
     };
 
     let expect = note.clone();
@@ -849,10 +995,11 @@ fn cmd_edit(args: &[&str]) -> i32 {
     match run_editor(&scratch) {
         // A non-zero editor is an abandoned edit, not a mangled note. Nothing was
         // written, so the scratch file is not worth keeping.
+        // A nonzero editor may still have saved: a write hook, a plugin, or a
+        // crash after the buffer hit disk all land here. Nothing was persisted to
+        // the scratchpad either way, so the scratch file is the only copy.
         Ok(status) if !status.success() => {
-            let _ = fs::remove_file(&scratch);
-            eprintln!("agent-mgr note edit: editor exited {status}, leaving the note alone");
-            return 1;
+            return keep(format!("editor exited {status}, so the note was left alone"));
         }
         Err(err) => return keep(format!("could not run the editor: {err}")),
         Ok(_) => {}
@@ -865,15 +1012,15 @@ fn cmd_edit(args: &[&str]) -> i32 {
     // Through `update`, so the merge happens under the lock against whatever the
     // file says now — an agent may well have appended while the editor was open.
     let mut applied = false;
-    if let Err(err) = update(&notes, |file| applied = splice(file, index, &expect, &edited)) {
+    if let Err(err) = update(&notes, |file| applied = splice(file, &expect, &edited)) {
         return keep(format!("could not write the scratchpad: {err}"));
     }
     if !applied {
-        return keep(format!(
-            "note {index} is not the one you opened any more — something else \
-             edited or deleted a note while the editor was open, so nothing was \
-             overwritten"
-        ));
+        return keep(
+            "the note you opened has been deleted, or can no longer be told apart \
+             from another, so nothing was overwritten"
+                .to_owned(),
+        );
     }
     let _ = fs::remove_file(&scratch);
     0
@@ -1162,20 +1309,32 @@ mod tests {
     // ─── mutation ────────────────────────────────────────────────
 
     #[test]
-    fn toggling_flips_only_the_selected_note() {
+    fn toggling_flips_only_the_note_it_was_handed() {
         let mut file = parse("## [ ] one\n\n## [ ] two\n");
-        file.toggle(1);
+        let two = file.notes[1].clone();
+        assert!(file.toggle_note(&two));
         assert!(!file.notes[0].done);
         assert!(file.notes[1].done);
-        file.toggle(1);
+        assert!(file.toggle_note(&two));
         assert!(!file.notes[1].done);
     }
 
     #[test]
-    fn toggling_out_of_range_is_a_no_op_rather_than_a_panic() {
-        // The index comes from a selection a concurrent write may have shortened.
+    fn toggling_a_note_that_moved_finds_it_rather_than_ticking_a_neighbour() {
+        // `Space` resolves by identity for the same reason `d` does: the cursor's
+        // index was true when the panel last drew, not when the write lands.
+        let mut file = parse("## [ ] one\n\n## [ ] two\n\n## [ ] three\n");
+        let three = file.notes[2].clone();
+        file.notes.remove(0); // another pane deleted "one"
+        assert!(file.toggle_note(&three));
+        assert!(file.notes[1].done, "found where it went");
+        assert!(!file.notes[0].done, "and did not tick its neighbour");
+    }
+
+    #[test]
+    fn toggling_a_vanished_note_reports_it_rather_than_panicking() {
         let mut file = parse("## [ ] one\n");
-        file.toggle(9);
+        assert!(!file.toggle_note(&Note::new("gone", "")));
         assert_eq!(file.len(), 1);
     }
 
@@ -1245,7 +1404,11 @@ mod tests {
         assert_eq!(stale.len(), 1);
 
         add(&path, &Note::new("second", "")).unwrap();
-        let after = update(&path, |file| file.toggle(0)).unwrap();
+        let first = stale.notes[0].clone();
+        let after = update(&path, |file| {
+            assert!(file.toggle_note(&first));
+        })
+        .unwrap();
 
         assert_eq!(titles(&after), ["first", "second"], "append survived");
         assert!(after.notes[0].done);
@@ -1261,7 +1424,7 @@ mod tests {
     fn editing_a_note_replaces_only_that_note() {
         let mut file = three_notes();
         let expect = file.notes[1].clone();
-        assert!(splice(&mut file, 1, &expect, "## [ ] two, rewritten\nwith a body now\n"));
+        assert!(splice(&mut file, &expect, "## [ ] two, rewritten\nwith a body now\n"));
         assert_eq!(file.len(), 3);
         assert_eq!(file.notes[1].title, "two, rewritten");
         assert_eq!(file.notes[1].body, "with a body now");
@@ -1278,7 +1441,7 @@ mod tests {
         for emptied in ["", "   ", "\n\n\t\n"] {
             let mut file = three_notes();
             let expect = file.notes[1].clone();
-            assert!(splice(&mut file, 1, &expect, emptied));
+            assert!(splice(&mut file, &expect, emptied));
             assert_eq!(file.len(), 2, "on {emptied:?}");
             assert_eq!(file.notes[0].title, "one");
             assert_eq!(file.notes[1].title, "three");
@@ -1291,7 +1454,7 @@ mod tests {
         // `## ` line. Nothing they typed is discarded either way.
         let mut file = three_notes();
         let expect = file.notes[0].clone();
-        assert!(splice(&mut file, 0, &expect, "just some prose\nover two lines\n"));
+        assert!(splice(&mut file, &expect, "just some prose\nover two lines\n"));
         assert_eq!(file.len(), 3);
         assert_eq!(file.notes[0].title, "one", "the original title survives");
         assert_eq!(file.notes[0].body, "just some prose\nover two lines");
@@ -1301,7 +1464,7 @@ mod tests {
     fn a_second_heading_splits_the_note_in_two() {
         let mut file = three_notes();
         let expect = file.notes[0].clone();
-        assert!(splice(&mut file, 0, &expect, "## [ ] first half\n\n## [x] second half\n"));
+        assert!(splice(&mut file, &expect, "## [ ] first half\n\n## [x] second half\n"));
         assert_eq!(file.len(), 4);
         assert_eq!(file.notes[0].title, "first half");
         assert_eq!(file.notes[1].title, "second half");
@@ -1316,7 +1479,7 @@ mod tests {
         let mut file = three_notes();
         let expect = Note::new("from nowhere", "");
         assert!(
-            !splice(&mut file, 9, &expect, "## [ ] from nowhere\n"),
+            !splice(&mut file, &expect, "## [ ] from nowhere\n"),
             "an out-of-range index must report that it wrote nothing"
         );
         assert_eq!(file, three_notes());
@@ -1331,7 +1494,6 @@ mod tests {
         let expect = file.notes[1].clone();
         assert!(splice(
             &mut file,
-            1,
             &expect,
             "a stray thought\n\n## [ ] two\nthe real body\n"
         ));
@@ -1345,46 +1507,90 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_of_a_note_that_moved_is_refused_rather_than_misapplied() {
-        // The index was resolved when the editor opened. If another sidebar
-        // deleted an earlier note meanwhile, everything below it shifted, and
-        // writing this edit over whatever now sits at that index would silently
-        // destroy an unrelated note.
+    fn an_edit_follows_a_note_that_moved_instead_of_writing_where_it_was() {
+        // The identity was captured when the editor opened. Another pane deleting
+        // an earlier note meanwhile shifts everything below it, so the index is
+        // worthless by the time the edit lands — but the note itself is still
+        // there and is still what the user meant.
         let mut file = three_notes();
         let opened = file.notes[2].clone();
         file.notes.remove(0); // somebody else deleted "one"
 
-        assert!(
-            !splice(&mut file, 2, &opened, "## [ ] rewritten\n"),
-            "index 2 is no longer the note the editor opened"
+        assert!(splice(&mut file, &opened, "## [ ] rewritten\n"));
+        assert_eq!(
+            titles(&file),
+            ["two", "rewritten"],
+            "the edit followed its note rather than landing on the neighbour"
         );
-        assert_eq!(titles(&file), ["two", "three"], "nothing was touched");
     }
 
     #[test]
-    fn deleting_a_note_that_moved_is_refused_rather_than_misapplied() {
+    fn an_edit_of_a_deleted_note_is_refused_rather_than_misapplied() {
+        let mut file = three_notes();
+        let opened = file.notes[2].clone();
+        file.notes.remove(2); // somebody else deleted the note being edited
+
+        assert!(!splice(&mut file, &opened, "## [ ] rewritten\n"));
+        assert_eq!(titles(&file), ["one", "two"], "nothing was touched");
+    }
+
+    #[test]
+    fn deleting_follows_a_note_that_moved() {
         // Same hazard from the `d` side: a `y` answered about one title must
-        // never remove a different one.
+        // remove that title, wherever it now sits.
         let mut file = three_notes();
         let confirmed = file.notes[2].clone();
         file.notes.remove(0);
 
-        assert!(!file.remove_matching(2, &confirmed));
-        assert_eq!(titles(&file), ["two", "three"]);
-        // And it still works when the index does point at the right note.
-        assert!(file.remove_matching(1, &confirmed));
+        assert!(file.remove_note(&confirmed));
         assert_eq!(titles(&file), ["two"]);
     }
 
     #[test]
-    fn two_notes_sharing_a_title_are_told_apart_by_their_origin_stamp() {
-        // Title alone is not an identity — the origin stamp is what makes one.
-        let mut file = parse(
-            "## [ ] same\n<!-- t=100 -->\n\n## [ ] same\n<!-- t=200 -->\n",
-        );
+    fn two_notes_that_cannot_be_told_apart_are_refused_rather_than_guessed() {
+        // Hand-written twins with no metadata. Guessing has a fifty-fifty chance
+        // of destroying the wrong one; declining costs a keystroke.
+        let mut file = parse("## [ ] same\n\n## [ ] same\n");
+        let ambiguous = file.notes[1].clone();
+        assert_eq!(file.locate(&ambiguous), None, "two candidates is no answer");
+        assert!(!file.remove_note(&ambiguous));
+        assert_eq!(file.len(), 2, "neither was touched");
+    }
+
+    #[test]
+    fn an_id_tells_apart_notes_that_are_otherwise_identical() {
+        // Which is the whole reason ids exist: title and origin together are not
+        // guaranteed unique, and `update` backfills so this is the steady state.
+        let mut file = parse("## [ ] same\n\n## [ ] same\n");
+        file.backfill_ids();
         let second = file.notes[1].clone();
-        assert!(!file.remove_matching(0, &second), "different stamp");
-        assert!(file.remove_matching(1, &second));
+        assert_ne!(file.notes[0].id(), file.notes[1].id(), "ids are distinct");
+        assert_eq!(file.locate(&second), Some(1));
+        assert!(file.remove_note(&second));
+        assert_eq!(file.len(), 1);
+    }
+
+    #[test]
+    fn backfilling_leaves_an_existing_id_alone() {
+        // An id is immutable or it is not an identity.
+        let mut file = parse("## [ ] one\n<!-- id=keepme -->\n\n## [ ] two\n");
+        file.backfill_ids();
+        assert_eq!(file.notes[0].id(), Some("keepme"));
+        assert!(file.notes[1].id().is_some());
+    }
+
+    #[test]
+    fn an_update_gives_every_note_an_id() {
+        // The convergence promise: one mutation and the ambiguous-match case
+        // stops existing for this file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "## [ ] one\n\n## [ ] two\n").unwrap();
+        let after = update(&path, |_| {}).unwrap();
+        assert!(after.notes.iter().all(|note| note.id().is_some()));
+        // And they survive the round trip through the file.
+        let (reread, _) = load(&path).unwrap();
+        assert_eq!(reread, after);
     }
 
     #[test]
@@ -1395,7 +1601,7 @@ mod tests {
         let mut file = parse("## [ ] one\n<!-- t=1700 from=work:2 -->\nbody\n");
         let round_tripped = block(&file.notes[0]);
         let expect = file.notes[0].clone();
-        assert!(splice(&mut file, 0, &expect, &round_tripped));
+        assert!(splice(&mut file, &expect, &round_tripped));
         assert_eq!(
             file.notes[0].meta,
             vec![

@@ -203,7 +203,7 @@ pub struct App {
     /// work out what you are answering; and the write can check the index still
     /// points at it, since another sidebar deleting an earlier note renumbers
     /// everything below. Deleting is the one thing here with no undo.
-    pub note_delete: Option<(usize, notes::Note)>,
+    pub note_delete: Option<notes::Note>,
     /// The last thing that went wrong, shown in the footer until the next key.
     ///
     /// A write that fails has to say so. The scratchpad is the one part of this
@@ -435,11 +435,20 @@ impl App {
         let (Some(state), Some(path)) = (self.notes_focus, self.notes_file.clone()) else {
             return;
         };
-        // The index is into the file we last read; resolving it against fresh
-        // content inside the lock is what makes that safe.
-        match notes::update(&path, |file| file.toggle(state.selected)) {
+        let Some(expect) = self.notes.notes.get(state.selected).cloned() else {
+            return;
+        };
+        // By identity, not by index. The cursor's index was true when the panel
+        // last drew; the write happens against whatever the file says now, and
+        // another pane deleting an earlier note in between would otherwise tick
+        // the box on a different note.
+        let mut toggled = false;
+        match notes::update(&path, |file| toggled = file.toggle_note(&expect)) {
             Ok(file) => {
                 self.notes = file;
+                if !toggled {
+                    self.note_error = Some(format!("{:?} moved or is gone", expect.title));
+                }
                 self.clamp_notes();
             }
             Err(err) => self.note_error = Some(format!("could not tick the box: {err}")),
@@ -454,7 +463,7 @@ impl App {
         let Some(note) = self.notes.notes.get(state.selected) else {
             return;
         };
-        self.note_delete = Some((state.selected, note.clone()));
+        self.note_delete = Some(note.clone());
     }
 
     /// Answer the confirmation. Anything but `y` cancels.
@@ -465,7 +474,7 @@ impl App {
     /// between the `d` and the `y` shifts everything below it — and answering
     /// "yes, delete *that* one" must never remove a different note.
     pub fn resolve_note_delete(&mut self, confirmed: bool) {
-        let (Some((index, expect)), Some(path)) = (self.note_delete.take(), self.notes_file.clone())
+        let (Some(expect), Some(path)) = (self.note_delete.take(), self.notes_file.clone())
         else {
             return;
         };
@@ -473,7 +482,7 @@ impl App {
             return;
         }
         let mut removed = false;
-        match notes::update(&path, |file| removed = file.remove_matching(index, &expect)) {
+        match notes::update(&path, |file| removed = file.remove_note(&expect)) {
             Ok(file) => {
                 self.notes = file;
                 if !removed {
@@ -491,14 +500,25 @@ impl App {
         }
     }
 
-    /// Which note `Enter` would open the overlay on.
+    /// How a subcommand should be told which note the cursor is on.
+    ///
+    /// `--id=` whenever the note has one, because the popup does not launch at
+    /// the instant the key is pressed: another pane can delete an earlier note in
+    /// between, and an index would then name — and the editor would then
+    /// overwrite — a note nobody asked for. A note with no id yet falls back to
+    /// its index, which is the pre-id behaviour and stops mattering the first
+    /// time anything writes the file.
     ///
     /// Returns the decision rather than acting on it, like
     /// [`Self::activation_target`]: spawning a `display-popup` in a test run would
     /// put a popup over the developer's own screen.
-    pub fn overlay_target(&self) -> Option<usize> {
+    pub fn overlay_target(&self) -> Option<String> {
         let selected = self.notes_focus?.selected;
-        (selected < self.notes.len()).then_some(selected)
+        let note = self.notes.notes.get(selected)?;
+        Some(match note.id() {
+            Some(id) => format!("--id={id}"),
+            None => selected.to_string(),
+        })
     }
 
     /// Read the note under the cursor in a popup, full body and all.
@@ -526,10 +546,10 @@ impl App {
     /// popup own it means the file changes and our own watch notices, exactly as
     /// it would for an edit made anywhere else.
     pub fn edit_note_overlay(&self) {
-        let Some(index) = self.overlay_target() else {
+        let Some(target) = self.overlay_target() else {
             return;
         };
-        self.note_popup(&format!("note edit {index}"));
+        self.note_popup(&format!("note edit {target}"));
     }
 
     /// Run an `agent-mgr note …` subcommand in a popup over the whole window.

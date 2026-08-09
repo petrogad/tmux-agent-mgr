@@ -945,7 +945,11 @@ mod tests {
         assert_eq!(app.overlay_target(), None, "no target without focus");
         press(&mut app, &worker, KeyCode::Char('n'));
         press(&mut app, &worker, KeyCode::Char('j'));
-        assert_eq!(app.overlay_target(), Some(1));
+        let target = app.overlay_target().expect("a target");
+        assert!(
+            target.starts_with("--id=") || target == "1",
+            "expected an id or the index, got {target:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -958,8 +962,8 @@ mod tests {
         press(&mut app, &worker, KeyCode::Char('n'));
         press(&mut app, &worker, KeyCode::Char('j'));
         press(&mut app, &worker, KeyCode::Char('d'));
-        let (index, target) = app.note_delete.clone().expect("the prompt is armed");
-        assert_eq!((index, target.title.as_str()), (1, "two"));
+        let target = app.note_delete.clone().expect("the prompt is armed");
+        assert_eq!(target.title, "two");
         assert_eq!(app.notes.len(), 3, "nothing gone yet");
 
         press(&mut app, &worker, KeyCode::Char('y'));
@@ -1062,7 +1066,39 @@ mod tests {
             Some("must not vanish"),
             "the typed title has to survive a failed write"
         );
-        assert!(app.note_error.is_some(), "and the failure has to be visible");
+        assert!(app.note_error.is_some(), "and the failure has to be recorded");
+        // Recorded is not the same as seen. The restored entry prompt also wants
+        // the footer, and whichever the renderer checks first is the only one
+        // that ever reaches the screen — so assert on the drawn text, not on the
+        // field. The next keypress clears the error, so an unrendered one is an
+        // error the user never had.
+        let footer = ui::footer_text(&app, 60);
+        assert!(
+            footer.contains("could not write"),
+            "the error never reached the footer: {footer:?}"
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn the_entry_prompt_comes_back_once_the_error_is_dismissed() {
+        // The error takes the footer, but only until the next key — after which
+        // what you typed is in front of you again, ready to retry.
+        let (mut app, worker, _) = notes_fixture("error-then-prompt", &["one"]);
+        let blocker = std::env::temp_dir().join("agent-mgr-blocker-2");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        app.notes_file = Some(blocker.join("notes.md"));
+
+        press(&mut app, &worker, KeyCode::Char('a'));
+        type_str(&mut app, &worker, "retry me");
+        press(&mut app, &worker, KeyCode::Enter);
+        assert!(ui::footer_text(&app, 60).contains("could not write"));
+
+        press(&mut app, &worker, KeyCode::Esc);
+        assert!(
+            app.note_entry.is_none(),
+            "Esc reached the prompt, so the prompt had the keyboard"
+        );
         let _ = std::fs::remove_file(&blocker);
     }
 
