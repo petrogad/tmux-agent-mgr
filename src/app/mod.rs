@@ -196,13 +196,20 @@ pub struct App {
     /// from the list too — jotting something down is the thing you want *without*
     /// first navigating to the panel.
     pub note_entry: Option<String>,
-    /// A pending `d`, holding the title it is about to delete.
+    /// A pending `d`, holding the note it is about to delete.
     ///
-    /// The title rather than just the index, so the prompt can name the note: a
-    /// bare "delete? y/n" makes you look back up at the cursor to find out what
-    /// you are answering about. Deleting is the one thing here with no undo — the
-    /// file is the only copy — so it is worth the extra keypress.
-    pub note_delete: Option<(usize, String)>,
+    /// The whole note rather than just the index, for two reasons: the prompt can
+    /// name it, since a bare "delete? y/n" makes you look back up at the cursor to
+    /// work out what you are answering; and the write can check the index still
+    /// points at it, since another sidebar deleting an earlier note renumbers
+    /// everything below. Deleting is the one thing here with no undo.
+    pub note_delete: Option<(usize, notes::Note)>,
+    /// The last thing that went wrong, shown in the footer until the next key.
+    ///
+    /// A write that fails has to say so. The scratchpad is the one part of this
+    /// plugin that *owns* data rather than reflecting tmux's, so a silent failure
+    /// is the difference between a note you have and a note you think you have.
+    pub note_error: Option<String>,
     /// Where the scratchpad lives, resolved once in [`run`]. `None` on a popup,
     /// and on any surface that has no panel to write for.
     pub notes_file: Option<std::path::PathBuf>,
@@ -250,6 +257,7 @@ impl App {
             notes_focus: None,
             note_entry: None,
             note_delete: None,
+            note_error: None,
             notes_file: None,
             size,
             quit: false,
@@ -308,12 +316,12 @@ impl App {
 
     /// Give the panel the keyboard.
     ///
-    /// A no-op with an empty scratchpad: the panel is zero rows tall then, and
-    /// focusing something invisible leaves you in a mode with no way to tell you
-    /// are in it. `a` is the key that works from empty, and it works from the
-    /// list anyway.
+    /// Gated on the panel having rows on screen, not merely on notes existing:
+    /// a short sidebar allocates it none, and focusing something invisible leaves
+    /// you in a mode with no way to tell you are in it. `a` is the key that works
+    /// regardless, and it works from the list anyway.
     pub fn open_notes(&mut self) {
-        if self.notes.is_empty() || !self.surface.shows_notes() {
+        if self.rows().notes == 0 {
             return;
         }
         self.pending_count = None;
@@ -397,7 +405,12 @@ impl App {
         // legible.
         let mut note = notes::Note::new(&title, "");
         note.meta = notes::origin_meta();
-        if notes::add(&path, &note).is_err() {
+        if let Err(err) = notes::add(&path, &note) {
+            // Hand the words back rather than swallowing them. An unwritable
+            // path would otherwise make the note look accepted — the prompt
+            // closes, nothing appears, and what you typed is gone.
+            self.note_entry = Some(title);
+            self.note_error = Some(format!("could not write the note: {err}"));
             return;
         }
         self.load_notes(&path);
@@ -424,9 +437,12 @@ impl App {
         };
         // The index is into the file we last read; resolving it against fresh
         // content inside the lock is what makes that safe.
-        if let Ok(file) = notes::update(&path, |file| file.toggle(state.selected)) {
-            self.notes = file;
-            self.clamp_notes();
+        match notes::update(&path, |file| file.toggle(state.selected)) {
+            Ok(file) => {
+                self.notes = file;
+                self.clamp_notes();
+            }
+            Err(err) => self.note_error = Some(format!("could not tick the box: {err}")),
         }
     }
 
@@ -438,29 +454,40 @@ impl App {
         let Some(note) = self.notes.notes.get(state.selected) else {
             return;
         };
-        self.note_delete = Some((state.selected, note.title.clone()));
+        self.note_delete = Some((state.selected, note.clone()));
     }
 
     /// Answer the confirmation. Anything but `y` cancels.
     ///
-    /// Confirming resolves the index against fresh content under the lock, like
-    /// every other mutation. The title captured when the prompt opened is only
-    /// what the prompt *says*; the delete itself is by index, and appends never
-    /// renumber, so the note named is the note removed.
+    /// Confirming resolves the index against fresh content under the lock, and
+    /// then checks it still points at the note the prompt named. Deletion is the
+    /// one operation that renumbers, so a second sidebar deleting an earlier note
+    /// between the `d` and the `y` shifts everything below it — and answering
+    /// "yes, delete *that* one" must never remove a different note.
     pub fn resolve_note_delete(&mut self, confirmed: bool) {
-        let (Some((index, _)), Some(path)) = (self.note_delete.take(), self.notes_file.clone())
+        let (Some((index, expect)), Some(path)) = (self.note_delete.take(), self.notes_file.clone())
         else {
             return;
         };
         if !confirmed {
             return;
         }
-        if let Ok(file) = notes::update(&path, |file| file.remove(index)) {
-            self.notes = file;
-            if self.notes.is_empty() {
-                self.close_notes();
+        let mut removed = false;
+        match notes::update(&path, |file| removed = file.remove_matching(index, &expect)) {
+            Ok(file) => {
+                self.notes = file;
+                if !removed {
+                    self.note_error = Some(format!(
+                        "{:?} moved or is already gone — nothing deleted",
+                        expect.title
+                    ));
+                }
+                if self.notes.is_empty() {
+                    self.close_notes();
+                }
+                self.clamp_notes();
             }
-            self.clamp_notes();
+            Err(err) => self.note_error = Some(format!("could not delete: {err}")),
         }
     }
 
@@ -607,6 +634,13 @@ impl App {
     /// hashes — a note appearing is a reason to repaint, and this is how the
     /// loop finds out.
     fn compose_notes(&mut self) {
+        // A pane shrunk while the panel had focus takes its rows away, and focus
+        // on rows that are no longer drawn is the same trap `open_notes` refuses
+        // to walk into — just arrived at from the other direction.
+        if self.rows().notes == 0 {
+            self.close_notes();
+            self.note_delete = None;
+        }
         self.notes_view = ui::notes::build(
             &self.notes,
             &ui::notes::Options {
@@ -946,6 +980,7 @@ fn fingerprint(app: &App) -> u64 {
     app.notes_focus.hash(&mut hasher);
     app.note_entry.hash(&mut hasher);
     app.note_delete.hash(&mut hasher);
+    app.note_error.hash(&mut hasher);
     hasher.finish()
 }
 

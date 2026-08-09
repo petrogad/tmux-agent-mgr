@@ -135,11 +135,14 @@ out where it belongs.
 | `Space` | in the panel | mark done |
 | `Enter` | in the panel | read the full note in a popup |
 | `e` | in the panel | open the note in `$EDITOR` |
+| `d` | in the panel | delete it, after a `y/n` confirmation |
 | `n` `q` `Esc` | in the panel | back to the list |
 
 `a` is for getting a title down fast; `e` is where the body gets written, in your
 own editor, in the markdown the file is already made of. Both popups are centred
-over the window. Emptying a note in the editor and saving is how you delete it.
+over the window. `d` names the note it is about to delete and only `y` goes ahead —
+there is no undo, the file is the only copy. Emptying a note in the editor and saving
+deletes it too.
 
 The panel is a mode, so `Space` marks a note done while it still jumps to a pane one
 row above. It takes at most a quarter of the sidebar and at most 12 rows, shrinks to

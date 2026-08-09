@@ -86,6 +86,16 @@ impl Note {
             body: body.trim_end().to_owned(),
         }
     }
+
+    /// Whether this is the same note as `other`, for re-resolving a stale index.
+    ///
+    /// Title and metadata, not the body and not the checkbox: the origin stamp is
+    /// effectively an identity because it carries the epoch second the note was
+    /// taken, while the body and the done flag are exactly the things a
+    /// concurrent edit or toggle is *allowed* to have changed underneath us.
+    pub fn is_same_as(&self, other: &Self) -> bool {
+        self.title == other.title && self.meta == other.meta
+    }
 }
 
 /// A parsed notes file.
@@ -115,14 +125,19 @@ impl NoteFile {
         }
     }
 
-    /// Drop a note. Out-of-range is a no-op, for the same reason as [`Self::toggle`].
+    /// Drop note `index`, but only if it is still the note `expect` describes.
     ///
-    /// The one operation that renumbers, which is why it is the TUI's alone: an
-    /// agent appending concurrently must never move the note under your cursor.
-    pub fn remove(&mut self, index: usize) {
-        if index < self.notes.len() {
-            self.notes.remove(index);
+    /// The one operation that renumbers, which is why identity is checked rather
+    /// than trusting the index: a second sidebar deleting an earlier note shifts
+    /// everything below it, and a `y` answered about one title must never remove
+    /// a different one. Returns whether it removed anything.
+    #[must_use]
+    pub fn remove_matching(&mut self, index: usize, expect: &Note) -> bool {
+        if !self.notes.get(index).is_some_and(|note| note.is_same_as(expect)) {
+            return false;
         }
+        self.notes.remove(index);
+        true
     }
 }
 
@@ -364,14 +379,29 @@ fn block(note: &Note) -> String {
 ///   should not lose the note over a typo.
 /// - **Several headings** splices them all in. Splitting one note into two by
 ///   typing a second heading is a reasonable thing to mean.
-pub fn splice(file: &mut NoteFile, index: usize, edited: &str) {
+/// - **Text above the first heading** is folded into the first replacement note's
+///   body. Prose typed above a heading has nowhere of its own to live in this
+///   format, and moving it a line down is the only outcome that keeps every
+///   character the user typed.
+///
+/// Returns `false` without touching anything when `index` no longer holds the
+/// note `expect` describes. The index was resolved when the editor opened and
+/// this runs after it closed; another sidebar deleting an earlier note in between
+/// renumbers everything after it, and writing an edit over an unrelated note is
+/// far worse than declining to write it at all.
+#[must_use]
+pub fn splice(file: &mut NoteFile, index: usize, expect: &Note, edited: &str) -> bool {
     let Some(original) = file.notes.get(index).cloned() else {
-        return;
+        return false;
     };
+    if !original.is_same_as(expect) {
+        return false;
+    }
     if edited.trim().is_empty() {
         file.notes.remove(index);
-        return;
+        return true;
     }
+
     let parsed = parse(edited);
     let replacement = if parsed.notes.is_empty() {
         vec![Note {
@@ -379,9 +409,23 @@ pub fn splice(file: &mut NoteFile, index: usize, edited: &str) {
             ..original
         }]
     } else {
-        parsed.notes
+        let mut notes = parsed.notes;
+        // Nothing the editor gave back may be dropped. A stray line above the
+        // first heading is either prose meant for this note or the wreckage of a
+        // clobbered heading; either way it belongs to the note it sits on.
+        let preamble = parsed.preamble.trim();
+        if !preamble.is_empty() {
+            let first = &mut notes[0];
+            first.body = if first.body.is_empty() {
+                preamble.to_owned()
+            } else {
+                format!("{preamble}\n\n{}", first.body)
+            };
+        }
+        notes
     };
     file.notes.splice(index..=index, replacement);
+    true
 }
 
 /// Append a note to raw file text.
@@ -672,6 +716,14 @@ pub fn origin_meta() -> Vec<(String, String)> {
     if let Ok(elapsed) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
         meta.push(("t".to_owned(), elapsed.as_secs().to_string()));
     }
+    // Only ask tmux when we are actually inside it. `display-message` happily
+    // answers from a default server that has nothing to do with this shell, so
+    // an unguarded query stamps a note taken at a plain terminal with whatever
+    // window some unrelated session happens to have focused — an origin that is
+    // not merely missing but wrong.
+    if std::env::var_os("TMUX").is_none() {
+        return meta;
+    }
     if let Some(from) = crate::tmux::commands::run_tmux(&["display-message", "-p", "#S:#I"]) {
         let from = from.trim();
         if !from.is_empty() {
@@ -775,46 +827,94 @@ fn cmd_edit(args: &[&str]) -> i32 {
         return 1;
     };
 
-    // A `.md` name so the editor picks the right syntax — the whole point of the
-    // format being markdown is that the tools you already have understand it.
-    let scratch = std::env::temp_dir().join(format!(
-        "agent-mgr-note-{index}-{}.md",
-        std::process::id()
-    ));
-    if let Err(err) = fs::write(&scratch, block(note)) {
-        eprintln!("agent-mgr note edit: {err}");
-        return 1;
-    }
-
-    let outcome = run_editor(&scratch);
-    let edited = fs::read_to_string(&scratch);
-    let _ = fs::remove_file(&scratch);
-
-    match outcome {
-        Ok(status) if !status.success() => {
-            // A non-zero editor is an abandoned edit, not a mangled note.
-            eprintln!("agent-mgr note edit: editor exited {status}, leaving the note alone");
-            return 1;
-        }
+    let expect = note.clone();
+    let scratch = match write_scratch(index, &block(note)) {
+        Ok(path) => path,
         Err(err) => {
             eprintln!("agent-mgr note edit: {err}");
             return 1;
         }
+    };
+
+    // The scratch file is the only copy of what was just typed until `update`
+    // has actually written it. Every failure below leaves it on disk and says
+    // where — a disk-full or a read-only notes file must cost you the write, not
+    // the words.
+    let keep = |reason: String| -> i32 {
+        eprintln!("agent-mgr note edit: {reason}");
+        eprintln!("  your edit is still at {}", scratch.display());
+        1
+    };
+
+    match run_editor(&scratch) {
+        // A non-zero editor is an abandoned edit, not a mangled note. Nothing was
+        // written, so the scratch file is not worth keeping.
+        Ok(status) if !status.success() => {
+            let _ = fs::remove_file(&scratch);
+            eprintln!("agent-mgr note edit: editor exited {status}, leaving the note alone");
+            return 1;
+        }
+        Err(err) => return keep(format!("could not run the editor: {err}")),
         Ok(_) => {}
     }
-    let Ok(edited) = edited else {
-        eprintln!("agent-mgr note edit: could not read the edited note back");
-        return 1;
+    let edited = match fs::read_to_string(&scratch) {
+        Ok(edited) => edited,
+        Err(err) => return keep(format!("could not read the edited note back: {err}")),
     };
 
     // Through `update`, so the merge happens under the lock against whatever the
     // file says now — an agent may well have appended while the editor was open.
-    // Appends never renumber, so `index` still means the same note.
-    if let Err(err) = update(&notes, |file| splice(file, index, &edited)) {
-        eprintln!("agent-mgr note edit: {err}");
-        return 1;
+    let mut applied = false;
+    if let Err(err) = update(&notes, |file| applied = splice(file, index, &expect, &edited)) {
+        return keep(format!("could not write the scratchpad: {err}"));
     }
+    if !applied {
+        return keep(format!(
+            "note {index} is not the one you opened any more — something else \
+             edited or deleted a note while the editor was open, so nothing was \
+             overwritten"
+        ));
+    }
+    let _ = fs::remove_file(&scratch);
     0
+}
+
+/// Create the editor's scratch file, readable only by its owner.
+///
+/// `create_new` rather than a plain write, so a stale file or a symlink planted
+/// at a guessable path cannot be followed. Notes hold whatever you put in them,
+/// which is reason enough not to leave one at mode 0644 in a shared `/tmp`.
+fn write_scratch(index: usize, contents: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = std::env::temp_dir();
+    let mut last = io::Error::other("no candidate scratch path");
+    // A handful of attempts, because the disambiguator is the clock: two edits in
+    // the same process in the same nanosecond is the only way to collide.
+    for attempt in 0..8 {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(attempt);
+        let path = dir.join(format!(
+            "agent-mgr-note-{index}-{}-{unique}.md",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut handle) => {
+                handle.write_all(contents.as_bytes())?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = err,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last)
 }
 
 /// Run the user's editor on one file, inheriting the terminal.
@@ -1160,7 +1260,8 @@ mod tests {
     #[test]
     fn editing_a_note_replaces_only_that_note() {
         let mut file = three_notes();
-        splice(&mut file, 1, "## [ ] two, rewritten\nwith a body now\n");
+        let expect = file.notes[1].clone();
+        assert!(splice(&mut file, 1, &expect, "## [ ] two, rewritten\nwith a body now\n"));
         assert_eq!(file.len(), 3);
         assert_eq!(file.notes[1].title, "two, rewritten");
         assert_eq!(file.notes[1].body, "with a body now");
@@ -1176,7 +1277,8 @@ mod tests {
         // The only delete this TUI has, and the obvious gesture for it.
         for emptied in ["", "   ", "\n\n\t\n"] {
             let mut file = three_notes();
-            splice(&mut file, 1, emptied);
+            let expect = file.notes[1].clone();
+            assert!(splice(&mut file, 1, &expect, emptied));
             assert_eq!(file.len(), 2, "on {emptied:?}");
             assert_eq!(file.notes[0].title, "one");
             assert_eq!(file.notes[1].title, "three");
@@ -1188,7 +1290,8 @@ mod tests {
         // Somebody editing a body should not lose the note by clobbering the
         // `## ` line. Nothing they typed is discarded either way.
         let mut file = three_notes();
-        splice(&mut file, 0, "just some prose\nover two lines\n");
+        let expect = file.notes[0].clone();
+        assert!(splice(&mut file, 0, &expect, "just some prose\nover two lines\n"));
         assert_eq!(file.len(), 3);
         assert_eq!(file.notes[0].title, "one", "the original title survives");
         assert_eq!(file.notes[0].body, "just some prose\nover two lines");
@@ -1197,7 +1300,8 @@ mod tests {
     #[test]
     fn a_second_heading_splits_the_note_in_two() {
         let mut file = three_notes();
-        splice(&mut file, 0, "## [ ] first half\n\n## [x] second half\n");
+        let expect = file.notes[0].clone();
+        assert!(splice(&mut file, 0, &expect, "## [ ] first half\n\n## [x] second half\n"));
         assert_eq!(file.len(), 4);
         assert_eq!(file.notes[0].title, "first half");
         assert_eq!(file.notes[1].title, "second half");
@@ -1210,8 +1314,77 @@ mod tests {
         // The index came from a sidebar cursor, and the file may have been
         // rewritten while the editor was open.
         let mut file = three_notes();
-        splice(&mut file, 9, "## [ ] from nowhere\n");
+        let expect = Note::new("from nowhere", "");
+        assert!(
+            !splice(&mut file, 9, &expect, "## [ ] from nowhere\n"),
+            "an out-of-range index must report that it wrote nothing"
+        );
         assert_eq!(file, three_notes());
+    }
+
+    #[test]
+    fn prose_typed_above_the_heading_is_kept_not_dropped() {
+        // It has nowhere of its own to live in this format, so it moves one line
+        // down into the body. What it must not do is vanish: the editor is the
+        // only place these words existed.
+        let mut file = three_notes();
+        let expect = file.notes[1].clone();
+        assert!(splice(
+            &mut file,
+            1,
+            &expect,
+            "a stray thought\n\n## [ ] two\nthe real body\n"
+        ));
+        assert_eq!(file.len(), 3);
+        assert!(
+            file.notes[1].body.contains("a stray thought"),
+            "preamble was discarded: {:?}",
+            file.notes[1].body
+        );
+        assert!(file.notes[1].body.contains("the real body"));
+    }
+
+    #[test]
+    fn an_edit_of_a_note_that_moved_is_refused_rather_than_misapplied() {
+        // The index was resolved when the editor opened. If another sidebar
+        // deleted an earlier note meanwhile, everything below it shifted, and
+        // writing this edit over whatever now sits at that index would silently
+        // destroy an unrelated note.
+        let mut file = three_notes();
+        let opened = file.notes[2].clone();
+        file.notes.remove(0); // somebody else deleted "one"
+
+        assert!(
+            !splice(&mut file, 2, &opened, "## [ ] rewritten\n"),
+            "index 2 is no longer the note the editor opened"
+        );
+        assert_eq!(titles(&file), ["two", "three"], "nothing was touched");
+    }
+
+    #[test]
+    fn deleting_a_note_that_moved_is_refused_rather_than_misapplied() {
+        // Same hazard from the `d` side: a `y` answered about one title must
+        // never remove a different one.
+        let mut file = three_notes();
+        let confirmed = file.notes[2].clone();
+        file.notes.remove(0);
+
+        assert!(!file.remove_matching(2, &confirmed));
+        assert_eq!(titles(&file), ["two", "three"]);
+        // And it still works when the index does point at the right note.
+        assert!(file.remove_matching(1, &confirmed));
+        assert_eq!(titles(&file), ["two"]);
+    }
+
+    #[test]
+    fn two_notes_sharing_a_title_are_told_apart_by_their_origin_stamp() {
+        // Title alone is not an identity — the origin stamp is what makes one.
+        let mut file = parse(
+            "## [ ] same\n<!-- t=100 -->\n\n## [ ] same\n<!-- t=200 -->\n",
+        );
+        let second = file.notes[1].clone();
+        assert!(!file.remove_matching(0, &second), "different stamp");
+        assert!(file.remove_matching(1, &second));
     }
 
     #[test]
@@ -1221,7 +1394,8 @@ mod tests {
         // where a note remembers when and where it came from.
         let mut file = parse("## [ ] one\n<!-- t=1700 from=work:2 -->\nbody\n");
         let round_tripped = block(&file.notes[0]);
-        splice(&mut file, 0, &round_tripped);
+        let expect = file.notes[0].clone();
+        assert!(splice(&mut file, 0, &expect, &round_tripped));
         assert_eq!(
             file.notes[0].meta,
             vec![

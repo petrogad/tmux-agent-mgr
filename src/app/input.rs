@@ -41,6 +41,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
     if key.kind == KeyEventKind::Release {
         return;
     }
+    // Any keypress dismisses the last error. It has been read by the time you
+    // reach for the next key, and a message that outlives the situation it
+    // describes is worse than none.
+    app.note_error = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     // While a prompt has the keyboard, letters are text rather than commands — `j`
@@ -954,7 +958,8 @@ mod tests {
         press(&mut app, &worker, KeyCode::Char('n'));
         press(&mut app, &worker, KeyCode::Char('j'));
         press(&mut app, &worker, KeyCode::Char('d'));
-        assert_eq!(app.note_delete, Some((1, "two".to_owned())));
+        let (index, target) = app.note_delete.clone().expect("the prompt is armed");
+        assert_eq!((index, target.title.as_str()), (1, "two"));
         assert_eq!(app.notes.len(), 3, "nothing gone yet");
 
         press(&mut app, &worker, KeyCode::Char('y'));
@@ -1034,6 +1039,70 @@ mod tests {
         let (mut app, worker, path) = notes_fixture("delete-list", &["one"]);
         press(&mut app, &worker, KeyCode::Char('d'));
         assert!(app.note_delete.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_write_says_so_and_hands_the_words_back() {
+        // The scratchpad is the one thing this plugin owns rather than reflects,
+        // so a silent failure is the difference between a note you have and a
+        // note you think you have.
+        let (mut app, worker, _) = notes_fixture("unwritable", &["one"]);
+        // A path that cannot be created: a directory component that is a file.
+        let blocker = std::env::temp_dir().join("agent-mgr-blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        app.notes_file = Some(blocker.join("notes.md"));
+
+        press(&mut app, &worker, KeyCode::Char('a'));
+        type_str(&mut app, &worker, "must not vanish");
+        press(&mut app, &worker, KeyCode::Enter);
+
+        assert_eq!(
+            app.note_entry.as_deref(),
+            Some("must not vanish"),
+            "the typed title has to survive a failed write"
+        );
+        assert!(app.note_error.is_some(), "and the failure has to be visible");
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn the_next_keypress_clears_a_stale_error() {
+        // A message that outlives the situation it describes is worse than none.
+        let (mut app, worker, path) = notes_fixture("error-clears", &["one"]);
+        app.note_error = Some("something went wrong".to_owned());
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert!(app.note_error.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pane_too_short_for_the_panel_refuses_focus() {
+        // Notes existing is not the same as the panel being on screen. Focusing
+        // rows that are not drawn is a mode with no way to tell you are in it.
+        let (mut app, worker, path) = notes_fixture("short-pane", &["one", "two"]);
+        app.size = (40, 8);
+        app.rebuild();
+        assert_eq!(app.rows().notes, 0, "the panel gets no rows this short");
+        press(&mut app, &worker, KeyCode::Char('n'));
+        assert!(app.notes_focus.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shrinking_the_pane_out_from_under_a_focused_panel_releases_it() {
+        // Same trap, arrived at from the other direction: focus first, then take
+        // the rows away.
+        let (mut app, worker, path) = notes_fixture("shrink", &["one", "two"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('d'));
+        assert!(app.notes_focus.is_some());
+        assert!(app.note_delete.is_some());
+
+        app.size = (40, 8);
+        app.rebuild();
+        assert!(app.notes_focus.is_none(), "focus survived the panel");
+        assert!(app.note_delete.is_none(), "so did a confirmation you cannot see");
         let _ = std::fs::remove_file(&path);
     }
 
