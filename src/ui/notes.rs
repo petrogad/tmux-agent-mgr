@@ -186,13 +186,68 @@ fn note_line(
     };
 
     let used = indent + width(&checkbox) + gap + width(&title);
-    vec![
+    let mut spans = vec![
         Span::styled(" ".repeat(indent), base),
         Span::styled(checkbox, base.fg(box_color)),
         Span::styled(" ".repeat(gap), base),
-        Span::styled(title, title_style),
-        Span::styled(pad_to(used, total_width), base),
-    ]
+    ];
+    spans.extend(title_spans(&title, title_style, base, theme, note.done));
+    spans.push(Span::styled(pad_to(used, total_width), base));
+    spans
+}
+
+/// Split a title on its inline `` `code` `` spans and colour them.
+///
+/// Titles are full of identifiers — `?next`, `@agent_mgr_bin`, `##` — and the
+/// backticks are already in the file because the format is markdown. Colouring
+/// them costs no columns and turns punctuation that was noise into the part of
+/// the title you were looking for.
+///
+/// Deliberately only this one span type. Bold and links are worth having in the
+/// overlay, where there is room to read; in a one-line title they would be four
+/// more ways for a row to look busy.
+fn title_spans(
+    title: &str,
+    text_style: Style,
+    base: Style,
+    theme: &Theme,
+    done: bool,
+) -> Vec<Span<'static>> {
+    if !title.contains('`') {
+        return vec![Span::styled(title.to_owned(), text_style)];
+    }
+    // A done note stays uniformly receded — picking code out of a crossed-off
+    // row would give it more weight than the open ones above it.
+    let code_style = if done {
+        text_style
+    } else {
+        base.fg(theme.branch)
+    };
+
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut rest = title;
+    while !rest.is_empty() {
+        // An unmatched backtick is left as literal text: a truncated title ends
+        // mid-span far more often than someone means a lone one.
+        if let Some(body) = rest.strip_prefix('`')
+            && let Some(end) = body.find('`')
+        {
+            if !plain.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut plain), text_style));
+            }
+            spans.push(Span::styled(rest[..end + 2].to_owned(), code_style));
+            rest = &rest[end + 2..];
+            continue;
+        }
+        let step = rest.chars().next().map_or(1, char::len_utf8);
+        plain.push_str(&rest[..step]);
+        rest = &rest[step..];
+    }
+    if !plain.is_empty() {
+        spans.push(Span::styled(plain, text_style));
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -519,6 +574,77 @@ mod tests {
         let first = build(&notes, &opts, &Theme::default());
         let second = build(&file(&[("a", false), ("b", true)]), &opts, &Theme::default());
         assert_eq!(first.plain, second.plain);
+    }
+
+    #[test]
+    fn inline_code_in_a_title_is_coloured_without_costing_a_column() {
+        // The backticks are already in the file because the format is markdown;
+        // colouring them turns punctuation that was noise into the part of the
+        // title you were looking for. It must not change the row's width.
+        let theme = Theme::default();
+        let notes = file(&[("set `@agent_mgr_bin` first", false)]);
+        let rendered = build(
+            &notes,
+            &Options {
+                total_width: 40,
+                height: 2,
+                ..Options::default()
+            },
+            &theme,
+        );
+        assert_eq!(width(&rendered.plain[1]), 40);
+        assert!(
+            rendered.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(theme.branch)),
+            "no code span was coloured"
+        );
+    }
+
+    #[test]
+    fn a_done_title_stays_uniformly_receded() {
+        // Picking code out of a crossed-off row would give it more weight than
+        // the open notes above it.
+        let theme = Theme::default();
+        let rendered = build(
+            &file(&[("ship `notes.rs`", true)]),
+            &Options {
+                total_width: 40,
+                height: 2,
+                ..Options::default()
+            },
+            &theme,
+        );
+        assert!(
+            rendered.lines[1]
+                .spans
+                .iter()
+                .all(|span| span.style.fg != Some(theme.branch))
+        );
+    }
+
+    #[test]
+    fn an_unmatched_backtick_in_a_title_is_left_as_text() {
+        // A truncated title ends mid-span far more often than anyone means a
+        // lone backtick.
+        let theme = Theme::default();
+        let rendered = build(
+            &file(&[("a lone ` backtick", false)]),
+            &Options {
+                total_width: 40,
+                height: 2,
+                ..Options::default()
+            },
+            &theme,
+        );
+        assert!(rendered.plain[1].contains("a lone ` backtick"));
+        assert!(
+            rendered.lines[1]
+                .spans
+                .iter()
+                .all(|span| span.style.fg != Some(theme.branch))
+        );
     }
 
     #[test]

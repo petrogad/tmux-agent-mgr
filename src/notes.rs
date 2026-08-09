@@ -48,7 +48,7 @@
 //! the format without a filesystem.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -678,7 +678,23 @@ fn cmd_list() -> i32 {
 
 /// Print one note as markdown. This is what the detail overlay runs.
 fn cmd_show(args: &[&str]) -> i32 {
-    let Some(index) = args.first().and_then(|raw| raw.parse::<usize>().ok()) else {
+    let mut index: Option<usize> = None;
+    let mut color = crate::highlight::When::default();
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--color=") {
+            let Some(parsed) = crate::highlight::When::parse(value) else {
+                eprintln!("agent-mgr note show: --color expects auto|always|never");
+                return 2;
+            };
+            color = parsed;
+        } else if let Ok(parsed) = arg.parse::<usize>() {
+            index = Some(parsed);
+        } else {
+            eprintln!("agent-mgr note show: unexpected argument {arg:?}");
+            return 2;
+        }
+    }
+    let Some(index) = index else {
         eprintln!("agent-mgr note show: expected a note index");
         return 2;
     };
@@ -693,7 +709,17 @@ fn cmd_show(args: &[&str]) -> i32 {
     // edited between the keypress and the popup opening, and a popup that reports
     // a failure is worse than one that says the note is gone.
     match file.notes.get(index) {
-        Some(note) => print!("{}", block(note)),
+        Some(note) => {
+            // The theme is only worth a handful of tmux reads once we know there
+            // is something to paint, and only when we are going to paint it.
+            let enabled = color.enabled(std::io::stdout().is_terminal());
+            let theme = if enabled {
+                crate::ui::theme::Theme::from_tmux()
+            } else {
+                crate::ui::theme::Theme::default()
+            };
+            print!("{}", crate::highlight::note(&block(note), &theme, enabled));
+        }
         None => println!("note {index} is no longer there"),
     }
     0

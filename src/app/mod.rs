@@ -440,7 +440,12 @@ impl App {
         let Some(index) = self.overlay_target() else {
             return;
         };
-        self.note_popup(&format!("note show {index} | ${{PAGER:-less -R}}"));
+        // `--color=always` because stdout here is the pager's pipe, not a
+        // terminal: an IsTerminal check alone would drop the colour in exactly
+        // the case that wants it. `-R` is what makes the pager pass it through.
+        self.note_popup(&format!(
+            "note show {index} --color=always | ${{PAGER:-less -R}}"
+        ));
     }
 
     /// Open the note under the cursor in `$EDITOR`.

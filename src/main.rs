@@ -20,6 +20,7 @@ mod app;
 mod daemon;
 mod detect;
 mod git;
+mod highlight;
 mod hook;
 mod model;
 mod nav;
