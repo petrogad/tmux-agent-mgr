@@ -154,7 +154,7 @@ or wherever `@agent_mgr_notes_file` points:
 <!-- t=1770000000 from=blueberry:3 -->
 The 302 out of /callback loses the `next` param.
 
-### Repro
+## Repro
 
 1. log out
 2. hit a protected route
@@ -169,9 +169,9 @@ Raised to 1500ms.
 ````
 
 The sidebar shows titles; everything under one is its body, and `Enter` is how you
-read it. **A note is an `h2`, so its own sections are `h3` and deeper** — a bare `## `
-at the start of a line starts the next note, wherever it appears. Inside a fenced
-code block it is safe.
+read it. **A note heading is `## ` plus a checkbox, and nothing else is** — so a body
+can use any markdown it likes, `##` sections included, without a subsection becoming
+the next note.
 
 Markdown rather than a private format because you are not the only writer: edit it in
 `$EDITOR`, or point an agent at it. The panel notices within a second either way.

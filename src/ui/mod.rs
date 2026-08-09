@@ -323,6 +323,18 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     if let Some(entry) = &app.note_entry {
         return prompt_line("note: ", entry, total_width, theme.accent, true);
     }
+    // Named, so you are not answering a bare "delete? y/n" and having to look
+    // back up at the cursor to work out what about. In the error colour because
+    // it is the one action here with no undo.
+    if let Some((_, title)) = &app.note_delete {
+        return prompt_line(
+            "delete ",
+            &format!("{title:?}? y/n"),
+            total_width,
+            theme.error,
+            false,
+        );
+    }
     // A half-typed count has to be visible: without an echo you cannot tell a
     // pending `1` from a keystroke that was dropped, and you find out only by
     // pressing `j` and going somewhere unexpected.

@@ -18,7 +18,7 @@
 //! <!-- t=2026-08-08T14:22:03Z from=blueberry:3 -->
 //! The 302 out of /callback loses the `next` param.
 //!
-//! ### Repro
+//! ## Repro
 //!
 //! 1. log out
 //! 2. hit a protected route
@@ -27,11 +27,14 @@
 //! Raised to 1500ms.
 //! ```
 //!
-//! A note is an `h2`, so **its body's own sections are `h3` and deeper**. That is
-//! ordinary markdown nesting rather than a rule we invented, and it is the one
-//! thing worth knowing before writing a long note: a bare `## ` at the start of a
-//! line begins the *next note*, wherever it appears. Inside a fence it is safe —
-//! notes are mostly about code, so that is the common case, not an exotic one.
+//! **A note heading is `## ` followed by a checkbox, and nothing else is.** That
+//! one rule is what lets a body contain whatever markdown it likes — `##`
+//! sections included — without a subsection silently becoming the next note. A
+//! bare `## Repro` is content.
+//!
+//! `append` has always written an explicit checkbox, so every note this program
+//! produced already conforms. A hand-written `## foo` degrades to body text, or
+//! to preamble if nothing precedes it; it is never dropped.
 //!
 //! Two properties the rest of the feature leans on:
 //!
@@ -112,6 +115,15 @@ impl NoteFile {
         }
     }
 
+    /// Drop a note. Out-of-range is a no-op, for the same reason as [`Self::toggle`].
+    ///
+    /// The one operation that renumbers, which is why it is the TUI's alone: an
+    /// agent appending concurrently must never move the note under your cursor.
+    pub fn remove(&mut self, index: usize) {
+        if index < self.notes.len() {
+            self.notes.remove(index);
+        }
+    }
 }
 
 // ─── parsing ─────────────────────────────────────────────────────────
@@ -173,12 +185,22 @@ pub fn parse(text: &str) -> NoteFile {
 }
 
 /// `## [x] title` → a note. `None` when the line is not a note heading.
+///
+/// **The checkbox is required.** A bare `## Repro` is body text, not a new note.
+///
+/// This used to be lenient, defaulting a checkbox-less heading to open, and that
+/// made `##` unusable inside a note: writing an ordinary markdown subsection
+/// silently split one note into two, with nothing to notice it. Since a note is
+/// itself an `h2`, `##` is precisely the level a body wants for its own sections,
+/// so the lenient reading cost more than it bought. Requiring the checkbox makes
+/// a note heading unambiguous — everything that is not one is content.
+///
+/// `append` has always written an explicit checkbox, so nothing this program
+/// produced is affected. A hand-written `## foo` degrades to body text of the
+/// note above it, or to preamble; it is never dropped.
 fn parse_heading(line: &str) -> Option<Note> {
     let rest = line.strip_prefix(HEADING)?;
-    let (done, title) = match strip_checkbox(rest) {
-        Some(pair) => pair,
-        None => (false, rest),
-    };
+    let (done, title) = strip_checkbox(rest)?;
     Some(Note {
         done,
         title: title.trim().to_owned(),
@@ -824,13 +846,42 @@ mod tests {
     // ─── parsing ─────────────────────────────────────────────────
 
     #[test]
-    fn a_heading_without_a_checkbox_is_an_open_note() {
-        // The format an agent actually writes when told "add a note". Requiring
-        // the checkbox would make the common case unparseable.
-        let file = parse("## fix the redirect\nbody\n");
-        assert_eq!(titles(&file), ["fix the redirect"]);
+    fn a_note_heading_needs_its_checkbox() {
+        // The rule that makes `##` usable inside a body. A note is itself an h2,
+        // so `##` is exactly the level a body reaches for; when a bare one started
+        // a new note, writing an ordinary subsection split a note in two with
+        // nothing to notice it.
+        let file = parse("## [ ] fix the redirect\nbody\n\n## Repro\n\nsteps\n");
+        assert_eq!(titles(&file), ["fix the redirect"], "still one note");
         assert!(!file.notes[0].done);
-        assert_eq!(file.notes[0].body, "body");
+        assert!(
+            file.notes[0].body.contains("## Repro"),
+            "the subsection belongs to the note: {:?}",
+            file.notes[0].body
+        );
+        assert!(file.notes[0].body.ends_with("steps"));
+    }
+
+    #[test]
+    fn a_checkbox_less_heading_before_any_note_becomes_preamble_not_a_loss() {
+        // The migration case: whatever a hand-written file had, nothing is
+        // dropped — it just stops being addressable as a note.
+        let file = parse("## an old hand-written heading\ntext\n\n## [ ] a real note\n");
+        assert_eq!(titles(&file), ["a real note"]);
+        assert!(file.preamble.contains("an old hand-written heading"));
+        assert!(file.preamble.contains("text"));
+    }
+
+    #[test]
+    fn a_note_survives_a_round_trip_with_h2_sections_in_its_body() {
+        // The property the whole change is for: what `note edit` writes back has
+        // to still read the same way after `render` and `parse`.
+        let source = "## [ ] one\n\n## Repro\n\nsteps\n";
+        let once = parse(source);
+        let twice = parse(&render(&once));
+        assert_eq!(once, twice);
+        assert_eq!(twice.len(), 1);
+        assert!(twice.notes[0].body.contains("## Repro"));
     }
 
     #[test]
@@ -842,7 +893,7 @@ mod tests {
 
     #[test]
     fn a_heading_needs_its_space_so_a_stray_hash_run_cannot_swallow_the_file() {
-        let file = parse("## one\n##notaheading\n###deeper\n");
+        let file = parse("## [ ] one\n##notaheading\n###deeper\n");
         assert_eq!(file.notes.len(), 1);
         assert!(file.notes[0].body.contains("##notaheading"));
     }
@@ -851,31 +902,31 @@ mod tests {
     fn a_heading_inside_a_fence_does_not_start_a_note() {
         // Notes are mostly about code, so bodies contain fenced markdown often
         // enough that an unfenced scan would split notes at random.
-        let file = parse("## one\n```md\n## not a note\n```\ntail\n");
+        let file = parse("## [ ] one\n```md\n## [ ] not a note\n```\ntail\n");
         assert_eq!(file.notes.len(), 1);
-        assert!(file.notes[0].body.contains("## not a note"));
+        assert!(file.notes[0].body.contains("## [ ] not a note"));
         assert!(file.notes[0].body.ends_with("tail"));
     }
 
     #[test]
     fn a_tilde_fence_and_a_longer_closing_fence_both_work() {
-        let file = parse("## one\n~~~\n## no\n~~~\n\n## two\n");
+        let file = parse("## [ ] one\n~~~\n## [ ] no\n~~~\n\n## [ ] two\n");
         assert_eq!(titles(&file), ["one", "two"]);
 
-        let nested = parse("## one\n````\n```\n## no\n````\n\n## two\n");
+        let nested = parse("## [ ] one\n````\n```\n## [ ] no\n````\n\n## [ ] two\n");
         assert_eq!(titles(&nested), ["one", "two"]);
     }
 
     #[test]
     fn text_before_the_first_note_is_preserved_as_preamble() {
-        let file = parse("# Notes\n\n## one\n");
+        let file = parse("# Notes\n\n## [ ] one\n");
         assert_eq!(file.preamble, "# Notes\n\n");
         assert_eq!(titles(&file), ["one"]);
     }
 
     #[test]
     fn metadata_is_read_only_from_the_line_under_the_heading() {
-        let file = parse("## one\nbody\n<!-- t=123 -->\n");
+        let file = parse("## [ ] one\nbody\n<!-- t=123 -->\n");
         assert!(file.notes[0].meta.is_empty(), "this one is prose");
         assert!(file.notes[0].body.contains("<!-- t=123 -->"));
     }
@@ -884,14 +935,14 @@ mod tests {
     fn an_unrecognised_comment_line_stays_in_the_body() {
         // Losing text somebody typed is the one unrecoverable failure here, so
         // anything that is not cleanly key/value is content.
-        let file = parse("## one\n<!-- freeform remark -->\nbody\n");
+        let file = parse("## [ ] one\n<!-- freeform remark -->\nbody\n");
         assert!(file.notes[0].meta.is_empty());
         assert!(file.notes[0].body.contains("freeform remark"));
     }
 
     #[test]
     fn metadata_keys_are_kept_in_order_including_unknown_ones() {
-        let file = parse("## one\n<!-- t=1 from=work:2 mystery=yes -->\n");
+        let file = parse("## [ ] one\n<!-- t=1 from=work:2 mystery=yes -->\n");
         let keys: Vec<&str> = file.notes[0]
             .meta
             .iter()
@@ -902,7 +953,7 @@ mod tests {
 
     #[test]
     fn trailing_blank_lines_are_separators_rather_than_body() {
-        let file = parse("## one\nbody\n\n\n## two\n");
+        let file = parse("## [ ] one\nbody\n\n\n## [ ] two\n");
         assert_eq!(file.notes[0].body, "body");
     }
 
@@ -925,7 +976,7 @@ mod tests {
         // Hand-written input is not canonical — ragged blank lines, a missing
         // checkbox, no trailing newline. One pass normalises it; a second must
         // change nothing, or every poll would rewrite the file.
-        let raw = "# Notes\n\n\n## one\nbody\n\n\n\n## [x] two";
+        let raw = "# Notes\n\n\n## [ ] one\nbody\n\n\n\n## [x] two";
         let once = render(&parse(raw));
         assert_eq!(render(&parse(&once)), once);
     }
@@ -948,7 +999,7 @@ mod tests {
     fn appending_never_renumbers_existing_notes() {
         // The whole reason the overlay can address a note by index: an agent
         // writing while you navigate must not move the note under your cursor.
-        let raw = "## one\n\n## two\n";
+        let raw = "## [ ] one\n\n## [ ] two\n";
         let after = parse(&append(raw, &Note::new("three", "")));
         assert_eq!(titles(&after), ["one", "two", "three"]);
     }
@@ -962,7 +1013,7 @@ mod tests {
 
     #[test]
     fn appending_to_a_file_without_a_trailing_newline_still_makes_a_heading() {
-        let out = append("## one\nbody", &Note::new("two", ""));
+        let out = append("## [ ] one\nbody", &Note::new("two", ""));
         assert_eq!(titles(&parse(&out)), ["one", "two"]);
     }
 
@@ -1012,7 +1063,7 @@ mod tests {
 
     #[test]
     fn toggling_flips_only_the_selected_note() {
-        let mut file = parse("## one\n\n## two\n");
+        let mut file = parse("## [ ] one\n\n## [ ] two\n");
         file.toggle(1);
         assert!(!file.notes[0].done);
         assert!(file.notes[1].done);
@@ -1023,7 +1074,7 @@ mod tests {
     #[test]
     fn toggling_out_of_range_is_a_no_op_rather_than_a_panic() {
         // The index comes from a selection a concurrent write may have shortened.
-        let mut file = parse("## one\n");
+        let mut file = parse("## [ ] one\n");
         file.toggle(9);
         assert_eq!(file.len(), 1);
     }

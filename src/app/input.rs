@@ -57,6 +57,18 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
         note_entry_key(key, app, ctrl);
         return;
     }
+    // A confirmation swallows the keyboard like any other prompt, so the `j` you
+    // press next cannot both answer it and move.
+    if app.note_delete.is_some() {
+        match key.code {
+            KeyCode::Char('c') if ctrl => app.quit = true,
+            // Only `y` deletes. Everything else — Esc, n, a mistyped letter, a
+            // stray Enter — cancels, because the safe answer should be the one
+            // you give by accident.
+            code => app.resolve_note_delete(code == KeyCode::Char('y')),
+        }
+        return;
+    }
     // Help is a page, not a prompt, but it still swallows keys: any key closing it
     // means you cannot accidentally act on a list you cannot currently see.
     if app.help {
@@ -156,6 +168,7 @@ fn notes_key(key: KeyEvent, app: &mut App, ctrl: bool) {
         // `a` gets the title down fast; `e` is where the body gets written, in a
         // real editor, in the markdown the file is already made of.
         KeyCode::Char('e') => app.edit_note_overlay(),
+        KeyCode::Char('d') => app.open_note_delete(),
         KeyCode::Char('?') => app.help = true,
         _ => {}
     }
@@ -929,6 +942,98 @@ mod tests {
         press(&mut app, &worker, KeyCode::Char('n'));
         press(&mut app, &worker, KeyCode::Char('j'));
         assert_eq!(app.overlay_target(), Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn d_asks_before_deleting_and_names_what_it_would_delete() {
+        // The one action here with no undo — the file is the only copy — so it is
+        // worth a keypress, and the prompt has to say which note or you are
+        // answering blind.
+        let (mut app, worker, path) = notes_fixture("delete-asks", &["one", "two", "three"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        press(&mut app, &worker, KeyCode::Char('d'));
+        assert_eq!(app.note_delete, Some((1, "two".to_owned())));
+        assert_eq!(app.notes.len(), 3, "nothing gone yet");
+
+        press(&mut app, &worker, KeyCode::Char('y'));
+        assert!(app.note_delete.is_none());
+        let (fresh, _) = crate::notes::load(&path).expect("reread");
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh.notes[0].title, "one");
+        assert_eq!(fresh.notes[1].title, "three");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn anything_but_y_cancels_the_delete() {
+        // The safe answer should be the one you give by accident.
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('n'),
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+            KeyCode::Char('Y'),
+        ] {
+            let (mut app, worker, path) = notes_fixture("delete-cancel", &["one", "two"]);
+            press(&mut app, &worker, KeyCode::Char('n'));
+            press(&mut app, &worker, KeyCode::Char('d'));
+            press(&mut app, &worker, code);
+            assert!(app.note_delete.is_none(), "{code:?} left the prompt open");
+            assert_eq!(app.notes.len(), 2, "{code:?} deleted something");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn the_confirmation_swallows_the_keyboard() {
+        // Otherwise the key you answer with also moves the cursor underneath.
+        let (mut app, worker, path) = notes_fixture("delete-swallow", &["one", "two", "three"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('d'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(
+            app.notes_focus.unwrap().selected,
+            0,
+            "j answered the prompt, it must not also have moved"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deleting_the_last_note_leaves_the_panel_rather_than_focusing_nothing() {
+        // The panel collapses to zero rows with no notes, and focus on an
+        // invisible panel is a mode with no way out.
+        let (mut app, worker, path) = notes_fixture("delete-last", &["only"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('d'));
+        press(&mut app, &worker, KeyCode::Char('y'));
+        assert!(app.notes.is_empty());
+        assert!(app.notes_focus.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_cursor_stays_in_range_after_deleting_the_last_row() {
+        // Deletion is the one operation that renumbers.
+        let (mut app, worker, path) = notes_fixture("delete-clamp", &["one", "two"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('G'));
+        assert_eq!(app.notes_focus.unwrap().selected, 1);
+        press(&mut app, &worker, KeyCode::Char('d'));
+        press(&mut app, &worker, KeyCode::Char('y'));
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(app.notes_focus.unwrap().selected, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn d_outside_the_panel_does_nothing() {
+        // `d` is panel-only; in the list it must not arm anything.
+        let (mut app, worker, path) = notes_fixture("delete-list", &["one"]);
+        press(&mut app, &worker, KeyCode::Char('d'));
+        assert!(app.note_delete.is_none());
         let _ = std::fs::remove_file(&path);
     }
 

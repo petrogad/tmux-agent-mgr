@@ -196,6 +196,13 @@ pub struct App {
     /// from the list too — jotting something down is the thing you want *without*
     /// first navigating to the panel.
     pub note_entry: Option<String>,
+    /// A pending `d`, holding the title it is about to delete.
+    ///
+    /// The title rather than just the index, so the prompt can name the note: a
+    /// bare "delete? y/n" makes you look back up at the cursor to find out what
+    /// you are answering about. Deleting is the one thing here with no undo — the
+    /// file is the only copy — so it is worth the extra keypress.
+    pub note_delete: Option<(usize, String)>,
     /// Where the scratchpad lives, resolved once in [`run`]. `None` on a popup,
     /// and on any surface that has no panel to write for.
     pub notes_file: Option<std::path::PathBuf>,
@@ -242,6 +249,7 @@ impl App {
             notes_scroll: 0,
             notes_focus: None,
             note_entry: None,
+            note_delete: None,
             notes_file: None,
             size,
             quit: false,
@@ -418,6 +426,40 @@ impl App {
         // content inside the lock is what makes that safe.
         if let Ok(file) = notes::update(&path, |file| file.toggle(state.selected)) {
             self.notes = file;
+            self.clamp_notes();
+        }
+    }
+
+    /// Arm the delete confirmation for the selected note.
+    pub fn open_note_delete(&mut self) {
+        let (Some(state), Some(_)) = (self.notes_focus, self.notes_file.as_ref()) else {
+            return;
+        };
+        let Some(note) = self.notes.notes.get(state.selected) else {
+            return;
+        };
+        self.note_delete = Some((state.selected, note.title.clone()));
+    }
+
+    /// Answer the confirmation. Anything but `y` cancels.
+    ///
+    /// Confirming resolves the index against fresh content under the lock, like
+    /// every other mutation. The title captured when the prompt opened is only
+    /// what the prompt *says*; the delete itself is by index, and appends never
+    /// renumber, so the note named is the note removed.
+    pub fn resolve_note_delete(&mut self, confirmed: bool) {
+        let (Some((index, _)), Some(path)) = (self.note_delete.take(), self.notes_file.clone())
+        else {
+            return;
+        };
+        if !confirmed {
+            return;
+        }
+        if let Ok(file) = notes::update(&path, |file| file.remove(index)) {
+            self.notes = file;
+            if self.notes.is_empty() {
+                self.close_notes();
+            }
             self.clamp_notes();
         }
     }
@@ -903,6 +945,7 @@ fn fingerprint(app: &App) -> u64 {
     app.notes_view.plain.hash(&mut hasher);
     app.notes_focus.hash(&mut hasher);
     app.note_entry.hash(&mut hasher);
+    app.note_delete.hash(&mut hasher);
     hasher.finish()
 }
 
