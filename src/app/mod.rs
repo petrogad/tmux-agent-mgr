@@ -383,7 +383,13 @@ impl App {
         let (Some(title), Some(path)) = (self.take_note_entry(), self.notes_file.clone()) else {
             return;
         };
-        if notes::add(&path, &notes::Note::new(&title, "")).is_err() {
+        // Same origin stamp `note add` writes, so a note taken here is
+        // indistinguishable from one taken at a shell — which matters, because
+        // "where was I when I wrote this" is most of what makes an old note
+        // legible.
+        let mut note = notes::Note::new(&title, "");
+        note.meta = notes::origin_meta();
+        if notes::add(&path, &note).is_err() {
             return;
         }
         self.load_notes(&path);

@@ -640,7 +640,12 @@ fn cmd_add(args: &[&str]) -> i32 {
 /// Best-effort: a note written outside tmux, or when the `display-message` fails,
 /// simply carries no origin. Refusing to record the note over missing metadata
 /// would be the wrong trade — the note is the point.
-fn origin_meta() -> Vec<(String, String)> {
+///
+/// Shared with the sidebar's own prompt rather than living in `cmd_add`, so a
+/// note taken with `a` records where it came from exactly as one taken from a
+/// shell does. It costs one `display-message`, on a keypress the user made —
+/// the same trade `activate_selection` already makes for `switch-client`.
+pub fn origin_meta() -> Vec<(String, String)> {
     let mut meta = Vec::new();
     if let Ok(elapsed) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
         meta.push(("t".to_owned(), elapsed.as_secs().to_string()));
