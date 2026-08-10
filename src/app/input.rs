@@ -1147,6 +1147,59 @@ mod tests {
     }
 
     #[test]
+    fn migrating_a_legacy_note_identifies_the_note_not_the_row() {
+        // The sidebar's index is stale by the time the lock is taken. With
+        // [alpha, beta, gamma] and the cursor on beta, another pane deleting
+        // alpha leaves beta at index 0 — and taking whatever sits at the old
+        // index 1 would hand the popup gamma's id instead.
+        let (mut app, worker, path) =
+            notes_fixture("migrate-race", &["alpha", "beta", "gamma"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.notes_focus.unwrap().selected, 1, "cursor on beta");
+
+        // Another pane deletes alpha, behind our back.
+        std::fs::write(&path, "## [ ] beta\n\n## [ ] gamma\n").unwrap();
+
+        let id = app.overlay_target().expect("beta still exists");
+        let landed = app
+            .notes
+            .notes
+            .iter()
+            .find(|note| note.id() == Some(id.as_str()))
+            .expect("the id is in the reloaded file");
+        assert_eq!(landed.title, "beta", "the popup was aimed at the wrong note");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migrating_a_note_that_vanished_refuses_rather_than_opening_a_neighbour() {
+        let (mut app, worker, path) = notes_fixture("migrate-gone", &["alpha", "beta"]);
+        press(&mut app, &worker, KeyCode::Char('n'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        std::fs::write(&path, "## [ ] alpha\n").unwrap(); // beta deleted elsewhere
+
+        assert!(app.overlay_target().is_none());
+        assert!(app.note_error.is_some(), "and it says why");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_new_note_lands_the_cursor_on_the_note_that_was_written() {
+        // The cursor is placed by the id `add` returned, not by taking the last
+        // row — see `an_appended_note_is_findable_by_the_id_add_returned` for the
+        // concurrent case the id is there for.
+        let (mut app, worker, path) = notes_fixture("append-lands", &["existing"]);
+        press(&mut app, &worker, KeyCode::Char('a'));
+        type_str(&mut app, &worker, "mine");
+        press(&mut app, &worker, KeyCode::Enter);
+
+        let selected = app.notes_focus.expect("focus landed").selected;
+        assert_eq!(app.notes.notes[selected].title, "mine");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn ctrl_c_still_quits_from_the_panel_and_from_its_prompt() {
         let (mut app, worker, path) = notes_fixture("ctrl-c", &["one"]);
         press(&mut app, &worker, KeyCode::Char('n'));

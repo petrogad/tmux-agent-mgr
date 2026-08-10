@@ -405,22 +405,32 @@ impl App {
         // legible.
         let mut note = notes::Note::new(&title, "");
         note.meta = notes::origin_meta();
-        if let Err(err) = notes::add(&path, &note) {
-            // Hand the words back rather than swallowing them. An unwritable
-            // path would otherwise make the note look accepted — the prompt
-            // closes, nothing appears, and what you typed is gone.
-            self.note_entry = Some(title);
-            self.note_error = Some(format!("could not write the note: {err}"));
-            return;
-        }
+        let assigned = match notes::add(&path, &note) {
+            Ok(id) => id,
+            Err(err) => {
+                // Hand the words back rather than swallowing them. An unwritable
+                // path would otherwise make the note look accepted — the prompt
+                // closes, nothing appears, and what you typed is gone.
+                self.note_entry = Some(title);
+                self.note_error = Some(format!("could not write the note: {err}"));
+                return;
+            }
+        };
         self.load_notes(&path);
-        // Land on what you just wrote. Appends never renumber, so the new note is
-        // the last one — and seeing the cursor arrive on it is the confirmation
+        // Land on what you just wrote — found by the id `add` handed back, not by
+        // taking the last row. An agent appending between our write and our read
+        // is the ordinary case here, and the last row would then be its note, not
+        // yours. Seeing the cursor arrive on your own line is the confirmation
         // that the write happened at all.
-        if !self.notes.is_empty() && self.surface.shows_notes() {
-            self.notes_focus = Some(NotesState {
-                selected: self.notes.len() - 1,
-            });
+        let landed = self
+            .notes
+            .notes
+            .iter()
+            .position(|note| note.id() == Some(assigned.as_str()));
+        if let Some(selected) = landed
+            && self.surface.shows_notes()
+        {
+            self.notes_focus = Some(NotesState { selected });
             self.clamp_notes();
         }
     }
@@ -514,13 +524,25 @@ impl App {
     /// put a popup over the developer's own screen.
     pub fn overlay_target(&mut self) -> Option<String> {
         let selected = self.notes_focus?.selected;
-        if let Some(id) = self.notes.notes.get(selected).and_then(notes::Note::id) {
+        let expect = self.notes.notes.get(selected)?.clone();
+        if let Some(id) = expect.id() {
             return Some(id.to_owned());
         }
-        // No id: migrate, then look again at the same cursor position. Nothing
-        // else has run in between, so the row under the cursor is the same row.
+        // No id: mint one for *this note*, inside the lock. The cursor's index is
+        // no more trustworthy here than anywhere else — between our last read and
+        // the locked re-read, another pane can delete an earlier note, and taking
+        // the row that ends up at the old index would hand the popup a different
+        // note's id. So the note is found by identity in the fresh file and given
+        // its id there, and the id is captured on the way past rather than read
+        // back afterwards: once assigned, `expect` no longer matches it.
         let path = self.notes_file.clone()?;
-        match notes::update(&path, |_| {}) {
+        let mut assigned = None;
+        match notes::update(&path, |file| {
+            if let Some(index) = file.locate(&expect) {
+                file.notes[index].ensure_id();
+                assigned = file.notes[index].id().map(str::to_owned);
+            }
+        }) {
             Ok(file) => self.notes = file,
             Err(err) => {
                 self.note_error = Some(format!("could not identify the note: {err}"));
@@ -528,16 +550,13 @@ impl App {
             }
         }
         self.clamp_notes();
-        let id = self
-            .notes
-            .notes
-            .get(selected)
-            .and_then(notes::Note::id)
-            .map(str::to_owned);
-        if id.is_none() {
-            self.note_error = Some("that note has no id and could not be given one".to_owned());
+        if assigned.is_none() {
+            self.note_error = Some(format!(
+                "{:?} moved or is gone — nothing was opened",
+                expect.title
+            ));
         }
-        id
+        assigned
     }
 
     /// Read the note under the cursor in a popup, full body and all.
@@ -1269,14 +1288,21 @@ mod tests {
         // @agent_mgr_bin is user config, and a note id comes out of a markdown
         // file that agents write. Validation already rejects a hostile id, but
         // this is the layer that has to hold if validation is ever relaxed.
+        //
+        // Every payload here is inert on purpose. This test exists to catch a
+        // quoting regression, which means the failure mode is "the shell runs
+        // it" — so a realistic payload would delete a home directory or make a
+        // network call on the way to reporting the bug. The metacharacters are
+        // what matter; what they would have run does not.
         for hostile in [
-            "x; rm -rf ~",
-            "$(whoami)",
-            "`id`",
+            "x; printf INJECTED",
+            "$(printf INJECTED)",
+            "`printf INJECTED`",
             "a'b",
             "a\nb",
-            "| tee /tmp/x",
-            "&& curl evil",
+            "| printf INJECTED",
+            "&& printf INJECTED",
+            "> /dev/null",
         ] {
             let quoted = sh_quote(hostile);
             // Echoing it back through a real shell must yield the input verbatim.

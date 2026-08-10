@@ -15,7 +15,7 @@
 //! # Notes
 //!
 //! ## [ ] auth redirect drops ?next
-//! <!-- t=2026-08-08T14:22:03Z from=blueberry:3 -->
+//! <!-- id=dkkrw2aliwa0i82 t=1770000000 from=blueberry:3 -->
 //! The 302 out of /callback loses the `next` param.
 //!
 //! ## Repro
@@ -38,14 +38,26 @@
 //!
 //! Two properties the rest of the feature leans on:
 //!
-//! - **Appends never renumber.** New notes go at the end, so an agent writing
-//!   while you navigate cannot move the note under your cursor. Only deletion
-//!   renumbers, and only the TUI deletes. That is what makes it safe for the
-//!   detail overlay to address a note by index.
+//! - **Nothing addresses a note by index.** Every read and every write resolves
+//!   through [`NoteFile::locate`], which finds a note by its `id=` wherever it
+//!   now sits and refuses when it cannot tell. An index is only true at the
+//!   instant it is read, and the gap before it is used spans a popup launch, an
+//!   editor session, or a `y/n` prompt — during which another pane can delete an
+//!   earlier note and shift everything below it.
 //! - **The file is the source of truth, not the TUI.** We hold a parsed snapshot
 //!   plus the [`Stamp`] it came from and reparse only when that changes; every
 //!   mutation re-reads under the lock first. Two agents appending at once must
 //!   not lose one.
+//!
+//! ## `id=` is reserved
+//!
+//! [`add`] assigns one to every note it writes and [`update`] backfills any that
+//! lack one, so a file converges on all-identified. The key is **ours**: a value
+//! that is not lowercase base-36 is treated as no id at all and is *replaced* on
+//! the next write rather than preserved, which is the one place this module
+//! overwrites metadata somebody else wrote. Two reasons it has to be that strict
+//! — an id ends up on a `display-popup` command line, and an id a text editor can
+//! rewrite is not an identity. Every other metadata key is left alone.
 //!
 //! Everything above the I/O section is pure, which is what lets the tests cover
 //! the format without a filesystem.
@@ -669,13 +681,18 @@ fn store_locked(path: &Path, file: &NoteFile) -> io::Result<()> {
 /// Re-reads inside the lock rather than trusting any snapshot the caller holds:
 /// this is the path several agents hit at once, and a read-modify-write over a
 /// stale copy is exactly how one of them loses.
-pub fn add(path: &Path, note: &Note) -> io::Result<()> {
+pub fn add(path: &Path, note: &Note) -> io::Result<String> {
     // Centrally, so no caller can produce an unidentified note: an id assigned
     // only by `update`'s backfill would leave every freshly written note
     // addressable by index alone until something else happened to rewrite the
     // file, which is exactly the window the ids exist to close.
     let mut note = note.clone();
     note.ensure_id();
+    // Handed back so a caller can find this note again afterwards. Re-reading and
+    // taking the last row would take whatever landed last, and an agent
+    // appending between the write and the read is the ordinary case here, not a
+    // race worth ignoring.
+    let assigned = note.id().unwrap_or_default().to_owned();
     let note = &note;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -692,7 +709,8 @@ pub fn add(path: &Path, note: &Note) -> io::Result<()> {
         handle.write_all(append(&text, note).as_bytes())?;
         handle.sync_all()?;
     }
-    fs::rename(&temp, path)
+    fs::rename(&temp, path)?;
+    Ok(assigned)
 }
 
 /// Apply a mutation to the file under the lock, re-reading first.
@@ -853,7 +871,7 @@ fn cmd_add(args: &[&str]) -> i32 {
     let mut note = Note::new(title, body.as_deref().unwrap_or(""));
     note.meta = origin_meta();
     match add(&path(), &note) {
-        Ok(()) => 0,
+        Ok(_) => 0,
         Err(err) => {
             eprintln!("agent-mgr note add: {err}");
             1
@@ -1651,6 +1669,29 @@ mod tests {
         let (file, _) = load(&path).unwrap();
         assert!(file.notes.iter().all(|note| note.id().is_some()));
         assert_ne!(file.notes[0].id(), file.notes[1].id());
+    }
+
+    #[test]
+    fn an_appended_note_is_findable_by_the_id_add_returned() {
+        // The whole reason `add` hands the id back. Somebody else appending
+        // between our write and our read is the ordinary case here — a sidebar
+        // per window, agents writing from panes — and "take the last row" would
+        // then land the cursor on their note.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        add(&path, &Note::new("existing", "")).unwrap();
+        let mine = add(&path, &Note::new("mine", "")).unwrap();
+        // Their append lands after ours, so it is now the final row.
+        add(&path, &Note::new("theirs", "")).unwrap();
+
+        let (file, _) = load(&path).unwrap();
+        let found = file
+            .notes
+            .iter()
+            .position(|note| note.id() == Some(mine.as_str()))
+            .expect("our note is still findable");
+        assert_eq!(file.notes[found].title, "mine");
+        assert_ne!(found, file.len() - 1, "and it is not the last row");
     }
 
     #[test]

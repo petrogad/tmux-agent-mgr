@@ -154,7 +154,7 @@ or wherever `@agent_mgr_notes_file` points:
 
 ````markdown
 ## [ ] auth redirect drops ?next
-<!-- t=1770000000 from=blueberry:3 -->
+<!-- id=dkkrw2aliwa0i82 t=1770000000 from=blueberry:3 -->
 The 302 out of /callback loses the `next` param.
 
 ## Repro
@@ -177,9 +177,14 @@ can use any markdown it likes, `##` sections included, without a subsection beco
 the next note.
 
 Markdown rather than a private format because you are not the only writer: edit it in
-`$EDITOR`, or point an agent at it. The panel notices within a second either way.
-Appends never renumber, so an agent writing while you navigate cannot move the note
-under your cursor. From a shell:
+`$EDITOR`, or point an agent at it. The panel notices within a second either way, and
+nothing here addresses a note by position — every action finds its note by `id=`, so
+another pane adding or deleting one while you are mid-edit cannot redirect it.
+
+`id=` is the one reserved key. It is written for you, it must stay lowercase
+alphanumeric, and a value that isn't gets replaced on the next write rather than kept
+— an id you can retype is not an identity. Every other key in that comment is yours
+and is preserved untouched. From a shell:
 
 ```sh
 agent-mgr note add "auth redirect drops ?next"
