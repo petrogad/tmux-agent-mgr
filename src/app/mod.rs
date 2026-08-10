@@ -537,10 +537,12 @@ impl App {
         // back afterwards: once assigned, `expect` no longer matches it.
         let path = self.notes_file.clone()?;
         let mut assigned = None;
+        let mut landed = None;
         match notes::update(&path, |file| {
             if let Some(index) = file.locate(&expect) {
                 file.notes[index].ensure_id();
                 assigned = file.notes[index].id().map(str::to_owned);
+                landed = Some(index);
             }
         }) {
             Ok(file) => self.notes = file,
@@ -548,6 +550,13 @@ impl App {
                 self.note_error = Some(format!("could not identify the note: {err}"));
                 return None;
             }
+        }
+        // The row the note moved to, not the row the cursor was on. The whole
+        // point of resolving by identity is that the two can differ, and leaving
+        // the cursor behind would open a popup on one note while the sidebar
+        // highlighted another — which reads as the popup being wrong.
+        if let (Some(index), Some(state)) = (landed, self.notes_focus.as_mut()) {
+            state.selected = index;
         }
         self.clamp_notes();
         if assigned.is_none() {

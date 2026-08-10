@@ -1169,6 +1169,10 @@ mod tests {
             .find(|note| note.id() == Some(id.as_str()))
             .expect("the id is in the reloaded file");
         assert_eq!(landed.title, "beta", "the popup was aimed at the wrong note");
+        // And the cursor followed it. A popup open on beta while the sidebar
+        // highlights gamma reads as the popup being wrong.
+        let selected = app.notes_focus.expect("still focused").selected;
+        assert_eq!(app.notes.notes[selected].title, "beta");
         let _ = std::fs::remove_file(&path);
     }
 

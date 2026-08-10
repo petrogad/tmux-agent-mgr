@@ -189,10 +189,16 @@ and is preserved untouched. From a shell:
 ```sh
 agent-mgr note add "auth redirect drops ?next"
 agent-mgr note add "check the fence case" --body -   # body on stdin
-agent-mgr note list
+agent-mgr note list                    # index, open/done, id, title
 agent-mgr note show 1
-agent-mgr note edit 1      # $EDITOR; this is what `e` runs in the popup
+agent-mgr note edit 1                  # $EDITOR; this is what `e` runs in the popup
+agent-mgr note edit --id=dkkrw2aliwa0i82
 ```
+
+An index is fine when you read it from `note list` and use it a second later.
+Anything that holds a reference across time — a script, a hook, an agent — should
+use `--id`, because a deletion from another pane renumbers everything below it. The
+sidebar always uses ids for exactly that reason.
 
 ### Reading a row
 

@@ -38,12 +38,18 @@
 //!
 //! Two properties the rest of the feature leans on:
 //!
-//! - **Nothing addresses a note by index.** Every read and every write resolves
-//!   through [`NoteFile::locate`], which finds a note by its `id=` wherever it
-//!   now sits and refuses when it cannot tell. An index is only true at the
-//!   instant it is read, and the gap before it is used spans a popup launch, an
-//!   editor session, or a `y/n` prompt — during which another pane can delete an
-//!   earlier note and shift everything below it.
+//! - **No sidebar action addresses a note by index.** Every read and every write
+//!   the TUI performs resolves through [`NoteFile::locate`], which finds a note
+//!   by its `id=` wherever it now sits and refuses when it cannot tell. An index
+//!   is only true at the instant it is read, and the gap before the TUI uses one
+//!   spans a popup launch, an editor session, or a `y/n` prompt — during which
+//!   another pane can delete an earlier note and shift everything below it.
+//!
+//!   The **CLI deliberately still accepts a bare index**, because
+//!   `note list` then `note edit 2` a second later is exactly the case an index
+//!   is good for: one person, one shell, nothing else writing. Anything holding a
+//!   reference across time — a script, a hook, another agent — should use
+//!   `--id`, which `note list` prints for this reason.
 //! - **The file is the source of truth, not the TUI.** We hold a parsed snapshot
 //!   plus the [`Stamp`] it came from and reparse only when that changes; every
 //!   mutation re-reads under the lock first. Two agents appending at once must
@@ -911,8 +917,14 @@ pub fn origin_meta() -> Vec<(String, String)> {
     meta
 }
 
-/// One line per note: index, `open`/`done`, title. Tab-separated, matching
+/// One line per note: index, `open`/`done`, id, title. Tab-separated, matching
 /// `daemon --once` — the quickest way to check the file without the TUI.
+///
+/// The id is here so a script has something safe to act on. An index is fine for
+/// a human reading this and typing `note edit 2` a second later, and useless to
+/// anything that holds it while other panes write; `--id` is the concurrency-safe
+/// form. A note with no id yet prints `-`, and gets one the first time anything
+/// writes the file.
 fn cmd_list() -> i32 {
     let (file, _) = match load(&path()) {
         Ok(loaded) => loaded,
@@ -923,7 +935,8 @@ fn cmd_list() -> i32 {
     };
     for (index, note) in file.notes.iter().enumerate() {
         let state = if note.done { "done" } else { "open" };
-        println!("{index}\t{state}\t{}", note.title);
+        let id = note.id().unwrap_or("-");
+        println!("{index}\t{state}\t{id}\t{}", note.title);
     }
     0
 }
@@ -1331,8 +1344,10 @@ mod tests {
 
     #[test]
     fn appending_never_renumbers_existing_notes() {
-        // The whole reason the overlay can address a note by index: an agent
-        // writing while you navigate must not move the note under your cursor.
+        // Nothing addresses a note by index any more, but this still matters: it
+        // is what keeps a bare `note edit 2` typed at a shell meaning the row
+        // `note list` just printed, even with agents writing in the background.
+        // Deletion renumbers; appending must not.
         let raw = "## [ ] one\n\n## [ ] two\n";
         let after = parse(&append(raw, &Note::new("three", "")));
         assert_eq!(titles(&after), ["one", "two", "three"]);
