@@ -500,40 +500,60 @@ impl App {
         }
     }
 
-    /// How a subcommand should be told which note the cursor is on.
+    /// The id of the note under the cursor, migrating the file if it has none.
     ///
-    /// `--id=` whenever the note has one, because the popup does not launch at
-    /// the instant the key is pressed: another pane can delete an earlier note in
-    /// between, and an index would then name — and the editor would then
-    /// overwrite — a note nobody asked for. A note with no id yet falls back to
-    /// its index, which is the pre-id behaviour and stops mattering the first
-    /// time anything writes the file.
+    /// **Never falls back to an index.** The popup does not launch at the instant
+    /// the key is pressed, and another pane deleting an earlier note in between
+    /// would make an index name — and the editor overwrite — a note nobody asked
+    /// for. A legacy note without an id is given one first, under the lock, by a
+    /// no-op `update` whose backfill does the work; if even that cannot establish
+    /// one, the answer is `None` and the caller declines.
     ///
     /// Returns the decision rather than acting on it, like
     /// [`Self::activation_target`]: spawning a `display-popup` in a test run would
     /// put a popup over the developer's own screen.
-    pub fn overlay_target(&self) -> Option<String> {
+    pub fn overlay_target(&mut self) -> Option<String> {
         let selected = self.notes_focus?.selected;
-        let note = self.notes.notes.get(selected)?;
-        Some(match note.id() {
-            Some(id) => format!("--id={id}"),
-            None => selected.to_string(),
-        })
+        if let Some(id) = self.notes.notes.get(selected).and_then(notes::Note::id) {
+            return Some(id.to_owned());
+        }
+        // No id: migrate, then look again at the same cursor position. Nothing
+        // else has run in between, so the row under the cursor is the same row.
+        let path = self.notes_file.clone()?;
+        match notes::update(&path, |_| {}) {
+            Ok(file) => self.notes = file,
+            Err(err) => {
+                self.note_error = Some(format!("could not identify the note: {err}"));
+                return None;
+            }
+        }
+        self.clamp_notes();
+        let id = self
+            .notes
+            .notes
+            .get(selected)
+            .and_then(notes::Note::id)
+            .map(str::to_owned);
+        if id.is_none() {
+            self.note_error = Some("that note has no id and could not be given one".to_owned());
+        }
+        id
     }
 
     /// Read the note under the cursor in a popup, full body and all.
     ///
     /// A pager rather than a bare `cat`, because a body can be longer than the
     /// popup and a note you cannot scroll is a note you cannot read.
-    pub fn show_note_overlay(&self) {
-        let Some(index) = self.overlay_target() else {
+    pub fn show_note_overlay(&mut self) {
+        let Some(id) = self.overlay_target() else {
             return;
         };
         // `--color=always` because stdout here is the pager's pipe, not a
         // terminal: an IsTerminal check alone would drop the colour in exactly
         // the case that wants it. `-R` is what makes the pager pass it through.
         self.note_popup(&format!(
-            "note show {index} --color=always | ${{PAGER:-less -R}}"
+            "note show --id={} --color=always | ${{PAGER:-less -R}}",
+            sh_quote(&id)
         ));
     }
 
@@ -545,11 +565,11 @@ impl App {
     /// moment at which this function could read the result back. Letting the
     /// popup own it means the file changes and our own watch notices, exactly as
     /// it would for an edit made anywhere else.
-    pub fn edit_note_overlay(&self) {
-        let Some(target) = self.overlay_target() else {
+    pub fn edit_note_overlay(&mut self) {
+        let Some(id) = self.overlay_target() else {
             return;
         };
-        self.note_popup(&format!("note edit {target}"));
+        self.note_popup(&format!("note edit --id={}", sh_quote(&id)));
     }
 
     /// Run an `agent-mgr note …` subcommand in a popup over the whole window.
@@ -563,8 +583,10 @@ impl App {
         let Some(bin) = tmux::global(tmux::CFG_BIN) else {
             return;
         };
-        // The binary path is user-supplied through @agent_mgr_bin and this string
-        // is handed to a shell, so it is quoted rather than interpolated bare.
+        // Everything interpolated into this string is quoted before it gets
+        // here: the binary path comes from @agent_mgr_bin and the note id comes
+        // out of a markdown file that people and agents both write. The string is
+        // handed to /bin/sh, so an unquoted `;` in either is a command.
         let command = format!("{} {subcommand}", sh_quote(&bin));
         tmux::run_tmux_quiet(&["display-popup", "-E", "-w", "70%", "-h", "70%", &command]);
     }
@@ -1239,6 +1261,36 @@ mod tests {
         app.rebuild();
         assert!(app.notes_view.is_empty());
         assert_eq!(app.list_height(), 38, "the popup keeps every body row");
+    }
+
+    #[test]
+    fn sh_quote_neutralises_everything_a_shell_would_act_on() {
+        // Both things interpolated into the popup command are attacker-adjacent:
+        // @agent_mgr_bin is user config, and a note id comes out of a markdown
+        // file that agents write. Validation already rejects a hostile id, but
+        // this is the layer that has to hold if validation is ever relaxed.
+        for hostile in [
+            "x; rm -rf ~",
+            "$(whoami)",
+            "`id`",
+            "a'b",
+            "a\nb",
+            "| tee /tmp/x",
+            "&& curl evil",
+        ] {
+            let quoted = sh_quote(hostile);
+            // Echoing it back through a real shell must yield the input verbatim.
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {quoted}"))
+                .output()
+                .expect("sh");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                hostile,
+                "{hostile:?} was not neutralised by {quoted}"
+            );
+        }
     }
 
     #[test]

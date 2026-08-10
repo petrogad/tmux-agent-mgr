@@ -945,11 +945,15 @@ mod tests {
         assert_eq!(app.overlay_target(), None, "no target without focus");
         press(&mut app, &worker, KeyCode::Char('n'));
         press(&mut app, &worker, KeyCode::Char('j'));
+        // An id, never an index. The popup launches after the keypress, so an
+        // index would name whatever occupies that slot by the time it opens.
         let target = app.overlay_target().expect("a target");
         assert!(
-            target.starts_with("--id=") || target == "1",
-            "expected an id or the index, got {target:?}"
+            crate::notes::valid_id(&target),
+            "expected a well-formed id, got {target:?}"
         );
+        // And it is the id of the note the cursor is actually on.
+        assert_eq!(app.notes.notes[1].id(), Some(target.as_str()));
         let _ = std::fs::remove_file(&path);
     }
 

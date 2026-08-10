@@ -87,15 +87,34 @@ impl Note {
         }
     }
 
-    /// This note's immutable identity, if it has one.
+    /// This note's immutable identity, if it has a usable one.
     ///
     /// Every note written since ids landed carries one, and [`update`] backfills
     /// the rest, so a file converges on all-identified after a single mutation.
+    ///
+    /// A value that is not in [`valid_id`]'s shape reads as *no id at all*. The
+    /// notes file is markdown that people and agents both edit, so its metadata
+    /// is untrusted input; an id also ends up inside a `display-popup` command
+    /// line, and the only safe way to hold that is to refuse anything that is not
+    /// plainly one of ours.
     pub fn id(&self) -> Option<&str> {
         self.meta
             .iter()
             .find(|(key, _)| key == ID_KEY)
             .map(|(_, value)| value.as_str())
+            .filter(|value| valid_id(value))
+    }
+
+    /// Give this note an id if it does not already have a usable one.
+    ///
+    /// Replaces rather than appends, so a junk or hostile `id=` in the file is
+    /// overwritten instead of leaving two keys with the same name.
+    pub fn ensure_id(&mut self) {
+        if self.id().is_some() {
+            return;
+        }
+        self.meta.retain(|(key, _)| key != ID_KEY);
+        self.meta.insert(0, (ID_KEY.to_owned(), new_id()));
     }
 
     /// Whether this *could* be the same note as `other`.
@@ -123,16 +142,44 @@ impl Note {
 /// Metadata key holding a note's immutable id.
 pub const ID_KEY: &str = "id";
 
+/// Longest id we will accept. Ours are around twenty characters; the bound is
+/// only here so a hand-edited file cannot put something enormous on a command
+/// line.
+const MAX_ID_LEN: usize = 64;
+
+/// Whether a metadata value is in the shape [`new_id`] produces.
+///
+/// Lowercase base-36, non-empty, bounded. Deliberately strict: this value is
+/// interpolated into a shell command, so the shape *is* the security boundary.
+/// Quoting alone would do the job, but an id that cannot contain a quote, a
+/// semicolon or a newline cannot go wrong if a later caller forgets to quote it.
+pub fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ID_LEN
+        && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// Monotonic within the process, so two notes added in the same nanosecond —
+/// which a loop of `note add` really can manage — still differ.
+static ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A fresh note id.
 ///
-/// Clock nanoseconds and the pid, base-36. Not a UUID and not trying to be:
-/// colliding needs two notes created in the same nanosecond by the same process,
-/// and the only thing an id has to survive is other notes moving around it.
+/// Clock nanoseconds, a process-local counter, and the pid, base-36. Not a UUID
+/// and not trying to be: the only thing an id has to survive is other notes
+/// moving around it. The counter covers same-nanosecond collisions within a
+/// process and the pid covers them across processes.
 fn new_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    format!("{}{}", base36(nanos), base36(u128::from(std::process::id())))
+    let seq = ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{}{}{}",
+        base36(nanos),
+        base36(u128::from(seq)),
+        base36(u128::from(std::process::id()))
+    )
 }
 
 fn base36(mut value: u128) -> String {
@@ -225,9 +272,7 @@ impl NoteFile {
     /// keep it — an id is immutable, or it is not an identity.
     fn backfill_ids(&mut self) {
         for note in &mut self.notes {
-            if note.id().is_none() {
-                note.meta.insert(0, (ID_KEY.to_owned(), new_id()));
-            }
+            note.ensure_id();
         }
     }
 }
@@ -511,6 +556,19 @@ pub fn splice(file: &mut NoteFile, expect: &Note, edited: &str) -> bool {
                 format!("{preamble}\n\n{}", first.body)
             };
         }
+        // The identity is ours, not the editor's. Whatever came back — the id
+        // deleted, mangled, or pasted onto a second note — the note being edited
+        // keeps the one it had, and anything the edit newly created gets its own.
+        // An id a text editor can rewrite is not an identity, and two notes
+        // sharing one would make both unaddressable.
+        notes[0].meta.retain(|(key, _)| key != ID_KEY);
+        if let Some(id) = original.id() {
+            notes[0].meta.insert(0, (ID_KEY.to_owned(), id.to_owned()));
+        }
+        for extra in &mut notes[1..] {
+            extra.meta.retain(|(key, _)| key != ID_KEY);
+            extra.ensure_id();
+        }
         notes
     };
     file.notes.splice(index..=index, replacement);
@@ -612,6 +670,13 @@ fn store_locked(path: &Path, file: &NoteFile) -> io::Result<()> {
 /// this is the path several agents hit at once, and a read-modify-write over a
 /// stale copy is exactly how one of them loses.
 pub fn add(path: &Path, note: &Note) -> io::Result<()> {
+    // Centrally, so no caller can produce an unidentified note: an id assigned
+    // only by `update`'s backfill would leave every freshly written note
+    // addressable by index alone until something else happened to rewrite the
+    // file, which is exactly the window the ids exist to close.
+    let mut note = note.clone();
+    note.ensure_id();
+    let note = &note;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -911,7 +976,11 @@ impl Target {
         let mut found = None;
         for arg in args {
             if let Some(id) = arg.strip_prefix("--id=") {
-                // An explicit id always wins over a positional index.
+                // An explicit id always wins over a positional index — but only
+                // a well-formed one. A value out of shape did not come from us.
+                if !valid_id(id) {
+                    return None;
+                }
                 return Some(Self::Id(id.to_owned()));
             }
             if let Ok(index) = arg.parse::<usize>() {
@@ -1568,6 +1637,111 @@ mod tests {
         assert_eq!(file.locate(&second), Some(1));
         assert!(file.remove_note(&second));
         assert_eq!(file.len(), 1);
+    }
+
+    #[test]
+    fn a_freshly_added_note_already_has_an_id() {
+        // Assigned in `add`, not left to the next `update`. An unidentified note
+        // is addressable only by index, which is the window ids exist to close —
+        // and the note you just wrote is the one you are most likely to open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        add(&path, &Note::new("first", "")).unwrap();
+        add(&path, &Note::new("second", "")).unwrap();
+        let (file, _) = load(&path).unwrap();
+        assert!(file.notes.iter().all(|note| note.id().is_some()));
+        assert_ne!(file.notes[0].id(), file.notes[1].id());
+    }
+
+    #[test]
+    fn ids_minted_back_to_back_are_distinct() {
+        // Two `note add` calls in a loop really can land in the same nanosecond;
+        // the counter is what separates them.
+        let ids: std::collections::HashSet<String> = (0..500).map(|_| new_id()).collect();
+        assert_eq!(ids.len(), 500);
+        assert!(ids.iter().all(|id| valid_id(id)));
+    }
+
+    #[test]
+    fn an_id_out_of_shape_is_treated_as_no_id_at_all() {
+        // The file is markdown that people and agents both write, and the value
+        // ends up on a `display-popup` command line. Anything that is not plainly
+        // one of ours does not get to be an identity.
+        for hostile in [
+            "x;rm -rf ~",
+            "a b",
+            "$(id)",
+            "`whoami`",
+            "'",
+            "UPPER",
+            "with-dash",
+            "",
+        ] {
+            let note = Note {
+                meta: vec![(ID_KEY.to_owned(), hostile.to_owned())],
+                ..Note::default()
+            };
+            assert_eq!(note.id(), None, "{hostile:?} was accepted as an id");
+        }
+        assert!(!valid_id(&"a".repeat(MAX_ID_LEN + 1)), "unbounded length");
+    }
+
+    #[test]
+    fn a_hostile_id_is_replaced_rather_than_duplicated() {
+        // Two `id=` keys would leave the note unaddressable and the junk one
+        // still sitting in the file.
+        let mut file = parse("## [ ] one\n<!-- id=x;rm -rf ~ -->\n");
+        file.backfill_ids();
+        let keys: Vec<&str> = file.notes[0]
+            .meta
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .filter(|key| *key == ID_KEY)
+            .collect();
+        assert_eq!(keys.len(), 1, "exactly one id key");
+        assert!(valid_id(file.notes[0].id().unwrap()));
+    }
+
+    #[test]
+    fn a_target_refuses_an_id_that_is_not_ours() {
+        assert!(Target::parse(&["--id=x;rm -rf ~"]).is_none());
+        assert!(Target::parse(&["--id=abc123"]).is_some());
+    }
+
+    #[test]
+    fn an_edit_cannot_change_the_id_it_was_handed() {
+        // An id a text editor can rewrite is not an identity. Whatever comes
+        // back — deleted, mangled, or swapped — the note keeps the one it had.
+        for tampered in [
+            "## [ ] one\n",                          // id deleted
+            "## [ ] one\n<!-- id=somethingelse -->\n", // id swapped
+            "## [ ] one\n<!-- id=x;rm -rf ~ -->\n",  // id made hostile
+        ] {
+            let mut file = parse("## [ ] one\n<!-- id=original -->\n");
+            let expect = file.notes[0].clone();
+            assert!(splice(&mut file, &expect, tampered));
+            assert_eq!(
+                file.notes[0].id(),
+                Some("original"),
+                "on {tampered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_a_note_gives_the_new_half_its_own_id() {
+        // Two notes sharing an id would make both unaddressable.
+        let mut file = parse("## [ ] one\n<!-- id=original -->\n");
+        let expect = file.notes[0].clone();
+        assert!(splice(
+            &mut file,
+            &expect,
+            "## [ ] first half\n<!-- id=original -->\n\n## [ ] second half\n<!-- id=original -->\n"
+        ));
+        assert_eq!(file.len(), 2);
+        assert_eq!(file.notes[0].id(), Some("original"), "the original keeps it");
+        assert!(file.notes[1].id().is_some());
+        assert_ne!(file.notes[0].id(), file.notes[1].id(), "and they differ");
     }
 
     #[test]
