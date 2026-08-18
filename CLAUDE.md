@@ -364,11 +364,20 @@ because it is how both agents mark a selected menu row.
 
 All four planned phases are done: passive sidebar, popup + navigation, Claude Code
 hooks, polish (git rows, tab glyphs, options, preview colour), plus the
-tmux-resurrect integration. Living docs for the
-work sit outside the repo, in `~/agents/handoffs/tmux-agent-mgr-phase1-handoff.md`
-and `~/agents/plans/tmux-agent-mgr-plan.md` — check them before starting, they carry
-the current status and the reasoning behind decisions that are not obvious from the
-code.
+tmux-resurrect integration.
+
+This fork adds a fifth: the global scratchpad (`notes.rs`), its sidebar panel
+(`ui/notes.rs`), and the markdown highlighter for its detail popup
+(`highlight.rs`). Upstream's out-of-scope list names "a bottom panel", which is
+why it lives here rather than going back as a PR. Its living doc is
+`~/agents/handoffs/agent-mgr-notes-panel-handoff.md` — it carries the reasoning
+behind the decisions that are not obvious from the code, including why the panel
+is a focus mode and why a note heading requires its checkbox.
+
+Two earlier docs this section used to point at,
+`~/agents/handoffs/tmux-agent-mgr-phase1-handoff.md` and
+`~/agents/plans/tmux-agent-mgr-plan.md`, no longer exist in the active dirs or in
+`archives/`. Do not go looking for them.
 
 Known gaps: the `▸ bg` row has no writer (deliberate, above), and the flicker check's
 companion case — that a *working* agent advances the spinner and nothing more — has

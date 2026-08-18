@@ -38,6 +38,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::daemon;
 use crate::model::{AgentState, AgentStatus, SessionGroup};
+use crate::notes;
 use crate::nav::{self, Direction};
 use crate::preview::PanePreview;
 use crate::search::Query;
@@ -126,6 +127,20 @@ pub struct RenameState {
     pub name: String,
 }
 
+/// The notes panel holding the keyboard.
+///
+/// A mode, like [`SearchState`] and [`RenameState`], rather than a shared keymap
+/// with the list. The panel wants `j`/`k` and `Space` and so does the list, and
+/// the alternative to a mode is a second vocabulary of modified keys for the same
+/// four motions. Modal also means the entry key is the only one that has to be
+/// globally free.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct NotesState {
+    /// Index into the file, not into the visible rows — the panel scrolls
+    /// underneath it.
+    pub selected: usize,
+}
+
 pub struct App {
     pub surface: Surface,
     /// Our own pane, excluded from the list and never navigated to. Empty in a
@@ -166,6 +181,38 @@ pub struct App {
     pub preview_lines: Vec<crate::preview::Line>,
     pub spinner: usize,
     pub list: RenderedList,
+    /// The scratchpad as last read from disk. Sized in rows by
+    /// [`ui::split_height`], so it is also what decides how tall the list is.
+    pub notes: notes::NoteFile,
+    /// The notes panel composed for the current geometry. Derived in
+    /// [`Self::rebuild`] for the same reason `preview_lines` is: it belongs to
+    /// the hashed output, not to `draw`.
+    pub notes_view: ui::notes::RenderedNotes,
+    /// First note the panel shows, tracking the cursor while the panel has focus.
+    pub notes_scroll: usize,
+    /// The panel with the keyboard, if it has it. See [`NotesState`].
+    pub notes_focus: Option<NotesState>,
+    /// A note being typed. Separate from [`Self::notes_focus`] because `a` works
+    /// from the list too — jotting something down is the thing you want *without*
+    /// first navigating to the panel.
+    pub note_entry: Option<String>,
+    /// A pending `d`, holding the note it is about to delete.
+    ///
+    /// The whole note rather than just the index, for two reasons: the prompt can
+    /// name it, since a bare "delete? y/n" makes you look back up at the cursor to
+    /// work out what you are answering; and the write can check the index still
+    /// points at it, since another sidebar deleting an earlier note renumbers
+    /// everything below. Deleting is the one thing here with no undo.
+    pub note_delete: Option<notes::Note>,
+    /// The last thing that went wrong, shown in the footer until the next key.
+    ///
+    /// A write that fails has to say so. The scratchpad is the one part of this
+    /// plugin that *owns* data rather than reflecting tmux's, so a silent failure
+    /// is the difference between a note you have and a note you think you have.
+    pub note_error: Option<String>,
+    /// Where the scratchpad lives, resolved once in [`run`]. `None` on a popup,
+    /// and on any surface that has no panel to write for.
+    pub notes_file: Option<std::path::PathBuf>,
     pub size: (u16, u16),
     /// Set to leave the loop; the pane closes with us, which is how the sidebar
     /// is dismissed from inside.
@@ -200,6 +247,18 @@ impl App {
                 plain: Vec::new(),
                 blocks: Vec::new(),
             },
+            // Deliberately empty rather than read here: `new` is what every test
+            // constructs, and loading the developer's own scratchpad would make
+            // the row split depend on what they happen to have written down.
+            // `run` fills it — see [`load_notes`].
+            notes: notes::NoteFile::default(),
+            notes_view: ui::notes::RenderedNotes::default(),
+            notes_scroll: 0,
+            notes_focus: None,
+            note_entry: None,
+            note_delete: None,
+            note_error: None,
+            notes_file: None,
             size,
             quit: false,
             frames: 0,
@@ -227,7 +286,361 @@ impl App {
     }
 
     pub fn list_height(&self) -> usize {
-        ui::list_height(self.size.1) as usize
+        self.rows().list as usize
+    }
+
+    /// How the pane's rows currently divide between the list and the panel.
+    fn rows(&self) -> ui::Rows {
+        ui::split_height(self.surface, self.size.1, self.notes.len())
+    }
+
+    /// Read the scratchpad off disk once, before the loop starts.
+    ///
+    /// The worker keeps it current from here on, so this exists only to fill the
+    /// *first* frame. Without it the panel would appear a beat after the sidebar
+    /// opens, and since the panel's rows come out of the list, that beat is a
+    /// visible reflow rather than just a late paint.
+    ///
+    /// A plain file read rather than a subprocess, so invariant 4 is untouched,
+    /// and it sits beside `Theme::from_tmux` in the same "resolve configuration
+    /// before the loop starts" slot. A missing or unreadable file is an empty
+    /// scratchpad, not an error: the first run has no file, and a panel is not
+    /// worth failing to open a sidebar over.
+    fn load_notes(&mut self, path: &std::path::Path) {
+        if let Ok((file, _stamp)) = notes::load(path) {
+            self.notes = file;
+        }
+    }
+
+    // ─── the notes panel ──────────────────────────────────────────────
+
+    /// Give the panel the keyboard.
+    ///
+    /// Gated on the panel having rows on screen, not merely on notes existing:
+    /// a short sidebar allocates it none, and focusing something invisible leaves
+    /// you in a mode with no way to tell you are in it. `a` is the key that works
+    /// regardless, and it works from the list anyway.
+    pub fn open_notes(&mut self) {
+        if self.rows().notes == 0 {
+            return;
+        }
+        self.pending_count = None;
+        self.notes_focus = Some(NotesState::default());
+        self.clamp_notes();
+    }
+
+    pub fn close_notes(&mut self) {
+        self.notes_focus = None;
+    }
+
+    /// Move the panel cursor, saturating at both ends.
+    ///
+    /// Deliberately not wrapping, unlike nothing else here — the list doesn't
+    /// wrap either, and a cursor that jumps from the last note to the first is
+    /// indistinguishable from one that lost its place.
+    pub fn move_note(&mut self, delta: isize) {
+        let Some(state) = self.notes_focus.as_mut() else {
+            return;
+        };
+        let last = self.notes.len().saturating_sub(1);
+        let next = state.selected as isize + delta;
+        state.selected = next.clamp(0, last as isize) as usize;
+        self.clamp_notes();
+    }
+
+    /// Keep the cursor in range and scrolled into view.
+    fn clamp_notes(&mut self) {
+        let last = self.notes.len().saturating_sub(1);
+        if let Some(state) = self.notes_focus.as_mut() {
+            state.selected = state.selected.min(last);
+        }
+        // One row of the panel is its header, so the notes get the rest.
+        let rows = (self.rows().notes as usize).saturating_sub(1);
+        let Some(selected) = self.notes_focus.map(|state| state.selected) else {
+            return;
+        };
+        if rows == 0 {
+            self.notes_scroll = 0;
+        } else if selected < self.notes_scroll {
+            self.notes_scroll = selected;
+        } else if selected >= self.notes_scroll + rows {
+            self.notes_scroll = selected + 1 - rows;
+        }
+    }
+
+    /// Open the prompt for a new note.
+    pub fn open_note_entry(&mut self) {
+        if self.notes_file.is_none() {
+            return;
+        }
+        self.pending_count = None;
+        self.note_entry = Some(String::new());
+    }
+
+    /// Take the typed title, if it is worth writing.
+    ///
+    /// Split from the write so the "what counts as a note" rule is testable
+    /// without touching a filesystem, the way `take_rename` splits from
+    /// `rename-window`. Blank is not a note: an empty heading in the file reads
+    /// as corruption, and there would be no way to select it to delete it.
+    pub fn take_note_entry(&mut self) -> Option<String> {
+        let title = self.note_entry.take()?;
+        let title = title.trim();
+        (!title.is_empty()).then(|| title.to_owned())
+    }
+
+    /// Write the typed note, and put the cursor on it.
+    ///
+    /// The append goes through [`notes::add`], which re-reads under the lock, so
+    /// a note an agent wrote a moment ago cannot be lost to our stale snapshot.
+    /// We then reload rather than pushing onto the snapshot for the same reason —
+    /// the file, not the TUI, is what is true.
+    pub fn commit_note_entry(&mut self) {
+        let (Some(title), Some(path)) = (self.take_note_entry(), self.notes_file.clone()) else {
+            return;
+        };
+        // Same origin stamp `note add` writes, so a note taken here is
+        // indistinguishable from one taken at a shell — which matters, because
+        // "where was I when I wrote this" is most of what makes an old note
+        // legible.
+        let mut note = notes::Note::new(&title, "");
+        note.meta = notes::origin_meta();
+        let assigned = match notes::add(&path, &note) {
+            Ok(id) => id,
+            Err(err) => {
+                // Hand the words back rather than swallowing them. An unwritable
+                // path would otherwise make the note look accepted — the prompt
+                // closes, nothing appears, and what you typed is gone.
+                self.note_entry = Some(title);
+                self.note_error = Some(format!("could not write the note: {err}"));
+                return;
+            }
+        };
+        self.load_notes(&path);
+        // Land on what you just wrote — found by the id `add` handed back, not by
+        // taking the last row. An agent appending between our write and our read
+        // is the ordinary case here, and the last row would then be its note, not
+        // yours. Seeing the cursor arrive on your own line is the confirmation
+        // that the write happened at all.
+        let landed = self
+            .notes
+            .notes
+            .iter()
+            .position(|note| note.id() == Some(assigned.as_str()));
+        if let Some(selected) = landed
+            && self.surface.shows_notes()
+        {
+            self.notes_focus = Some(NotesState { selected });
+            self.clamp_notes();
+        }
+    }
+
+    /// Flip the selected note's done flag.
+    ///
+    /// Through [`notes::update`], which re-reads under the lock and hands back
+    /// fresh content, so a concurrent append is merged rather than clobbered. The
+    /// result is applied straight away instead of waiting for the worker's next
+    /// pass: a checkbox that takes a second to tick reads as a dropped keypress.
+    pub fn toggle_selected_note(&mut self) {
+        let (Some(state), Some(path)) = (self.notes_focus, self.notes_file.clone()) else {
+            return;
+        };
+        let Some(expect) = self.notes.notes.get(state.selected).cloned() else {
+            return;
+        };
+        // By identity, not by index. The cursor's index was true when the panel
+        // last drew; the write happens against whatever the file says now, and
+        // another pane deleting an earlier note in between would otherwise tick
+        // the box on a different note.
+        let mut toggled = false;
+        match notes::update(&path, |file| toggled = file.toggle_note(&expect)) {
+            Ok(file) => {
+                self.notes = file;
+                if !toggled {
+                    self.note_error = Some(format!("{:?} moved or is gone", expect.title));
+                }
+                self.clamp_notes();
+            }
+            Err(err) => self.note_error = Some(format!("could not tick the box: {err}")),
+        }
+    }
+
+    /// Arm the delete confirmation for the selected note.
+    pub fn open_note_delete(&mut self) {
+        let (Some(state), Some(_)) = (self.notes_focus, self.notes_file.as_ref()) else {
+            return;
+        };
+        let Some(note) = self.notes.notes.get(state.selected) else {
+            return;
+        };
+        self.note_delete = Some(note.clone());
+    }
+
+    /// Answer the confirmation. Anything but `y` cancels.
+    ///
+    /// Confirming resolves the index against fresh content under the lock, and
+    /// then checks it still points at the note the prompt named. Deletion is the
+    /// one operation that renumbers, so a second sidebar deleting an earlier note
+    /// between the `d` and the `y` shifts everything below it — and answering
+    /// "yes, delete *that* one" must never remove a different note.
+    pub fn resolve_note_delete(&mut self, confirmed: bool) {
+        let (Some(expect), Some(path)) = (self.note_delete.take(), self.notes_file.clone())
+        else {
+            return;
+        };
+        if !confirmed {
+            return;
+        }
+        let mut removed = false;
+        match notes::update(&path, |file| removed = file.remove_note(&expect)) {
+            Ok(file) => {
+                self.notes = file;
+                if !removed {
+                    self.note_error = Some(format!(
+                        "{:?} moved or is already gone — nothing deleted",
+                        expect.title
+                    ));
+                }
+                if self.notes.is_empty() {
+                    self.close_notes();
+                }
+                self.clamp_notes();
+            }
+            Err(err) => self.note_error = Some(format!("could not delete: {err}")),
+        }
+    }
+
+    /// The id of the note under the cursor, migrating the file if it has none.
+    ///
+    /// **Never falls back to an index.** The popup does not launch at the instant
+    /// the key is pressed, and another pane deleting an earlier note in between
+    /// would make an index name — and the editor overwrite — a note nobody asked
+    /// for. A legacy note without an id is given one first, under the lock, by a
+    /// no-op `update` whose backfill does the work; if even that cannot establish
+    /// one, the answer is `None` and the caller declines.
+    ///
+    /// Returns the decision rather than acting on it, like
+    /// [`Self::activation_target`]: spawning a `display-popup` in a test run would
+    /// put a popup over the developer's own screen.
+    pub fn overlay_target(&mut self) -> Option<String> {
+        let selected = self.notes_focus?.selected;
+        let expect = self.notes.notes.get(selected)?.clone();
+        if let Some(id) = expect.id() {
+            return Some(id.to_owned());
+        }
+        // No id: mint one for *this note*, inside the lock. The cursor's index is
+        // no more trustworthy here than anywhere else — between our last read and
+        // the locked re-read, another pane can delete an earlier note, and taking
+        // the row that ends up at the old index would hand the popup a different
+        // note's id. So the note is found by identity in the fresh file and given
+        // its id there, and the id is captured on the way past rather than read
+        // back afterwards: once assigned, `expect` no longer matches it.
+        let path = self.notes_file.clone()?;
+        let mut assigned = None;
+        let mut landed = None;
+        match notes::update(&path, |file| {
+            if let Some(index) = file.locate(&expect) {
+                file.notes[index].ensure_id();
+                assigned = file.notes[index].id().map(str::to_owned);
+                landed = Some(index);
+            }
+        }) {
+            Ok(file) => self.notes = file,
+            Err(err) => {
+                self.note_error = Some(format!("could not identify the note: {err}"));
+                return None;
+            }
+        }
+        // The row the note moved to, not the row the cursor was on. The whole
+        // point of resolving by identity is that the two can differ, and leaving
+        // the cursor behind would open a popup on one note while the sidebar
+        // highlighted another — which reads as the popup being wrong.
+        if let (Some(index), Some(state)) = (landed, self.notes_focus.as_mut()) {
+            state.selected = index;
+        }
+        self.clamp_notes();
+        if assigned.is_none() {
+            self.note_error = Some(format!(
+                "{:?} moved or is gone — nothing was opened",
+                expect.title
+            ));
+        }
+        assigned
+    }
+
+    /// Read the note under the cursor in a popup, full body and all.
+    ///
+    /// A pager rather than a bare `cat`, because a body can be longer than the
+    /// popup and a note you cannot scroll is a note you cannot read.
+    pub fn show_note_overlay(&mut self) {
+        let Some(id) = self.overlay_target() else {
+            return;
+        };
+        // `--color=always` because stdout here is the pager's pipe, not a
+        // terminal: an IsTerminal check alone would drop the colour in exactly
+        // the case that wants it. `-R` is what makes the pager pass it through.
+        self.note_popup(&format!(
+            "note show --id={} --color=always | ${{PAGER:-less -R}}",
+            sh_quote(&id)
+        ));
+    }
+
+    /// Open the note under the cursor in `$EDITOR`.
+    ///
+    /// The whole round trip — extract, edit, merge back under the lock — lives in
+    /// `agent-mgr note edit`, not here. `display-popup` runs on the attached
+    /// client and the `tmux` process we spawn returns immediately, so there is no
+    /// moment at which this function could read the result back. Letting the
+    /// popup own it means the file changes and our own watch notices, exactly as
+    /// it would for an edit made anywhere else.
+    pub fn edit_note_overlay(&mut self) {
+        let Some(id) = self.overlay_target() else {
+            return;
+        };
+        self.note_popup(&format!("note edit --id={}", sh_quote(&id)));
+    }
+
+    /// Run an `agent-mgr note …` subcommand in a popup over the whole window.
+    ///
+    /// Centred, which is tmux's default when no `-x`/`-y` is given: this is a
+    /// thing you stop and read or write, not a side panel to glance at, and it
+    /// should sit on top of everything rather than off in a corner. Bordered too,
+    /// unlike the full-screen popup which passes `-B` — the border is what
+    /// separates it from the work behind it. Needs tmux >= 3.3, same as that one.
+    fn note_popup(&self, subcommand: &str) {
+        let Some(bin) = tmux::global(tmux::CFG_BIN) else {
+            return;
+        };
+        // Everything interpolated into this string is quoted before it gets
+        // here: the binary path comes from @agent_mgr_bin and the note id comes
+        // out of a markdown file that people and agents both write. The string is
+        // handed to /bin/sh, so an unquoted `;` in either is a command.
+        let command = format!("{} {subcommand}", sh_quote(&bin));
+        tmux::run_tmux_quiet(&["display-popup", "-E", "-w", "70%", "-h", "70%", &command]);
+    }
+
+    /// Take a reparsed scratchpad from a worker snapshot.
+    ///
+    /// Split from the drain in [`run`] so the "unchanged means keep what we have"
+    /// rule is testable without a worker thread — getting it backwards would blank
+    /// the panel once per interval.
+    pub fn apply_notes(&mut self, notes: Option<notes::NoteFile>) {
+        let Some(notes) = notes else {
+            return;
+        };
+        self.notes = notes;
+        // A file that shrank can leave the offset past the end. The row builder
+        // clamps for rendering, but the stored offset has to come back too, or
+        // the panel stays scrolled to nothing once notes are added again.
+        self.notes_scroll = self
+            .notes_scroll
+            .min(self.notes.len().saturating_sub(1));
+        // A scratchpad emptied from elsewhere collapses the panel to nothing, and
+        // focus on an invisible panel is a mode with no way out.
+        if self.notes.is_empty() {
+            self.close_notes();
+        }
+        self.clamp_notes();
     }
 
     /// The active search query, or an empty one when no search is open.
@@ -282,6 +695,32 @@ impl App {
         self.clamp_scroll();
         self.counts = Counts::tally(&self.sessions);
         self.compose_preview();
+        self.compose_notes();
+    }
+
+    /// Re-compose the notes panel for the current geometry.
+    ///
+    /// Here rather than in `draw` so the panel's text is part of what the loop
+    /// hashes — a note appearing is a reason to repaint, and this is how the
+    /// loop finds out.
+    fn compose_notes(&mut self) {
+        // A pane shrunk while the panel had focus takes its rows away, and focus
+        // on rows that are no longer drawn is the same trap `open_notes` refuses
+        // to walk into — just arrived at from the other direction.
+        if self.rows().notes == 0 {
+            self.close_notes();
+            self.note_delete = None;
+        }
+        self.notes_view = ui::notes::build(
+            &self.notes,
+            &ui::notes::Options {
+                total_width: ui::split_width(self.surface, self.size.0).0 as usize,
+                height: self.rows().notes as usize,
+                scroll: self.notes_scroll,
+                selected: self.notes_focus.map(|state| state.selected),
+            },
+            &self.theme,
+        );
     }
 
     /// Take in where tmux focus now is, moving the cursor if it moved.
@@ -571,6 +1010,15 @@ fn filter_sessions(
         .collect()
 }
 
+/// Wrap a string so a POSIX shell sees it as one literal word.
+///
+/// Single quotes, with the one escape they need for a single quote inside. The
+/// popup command is assembled here and executed by `/bin/sh`, so a path with a
+/// space in it is a broken overlay and a path with a `;` in it is worse.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 /// Hash of everything that affects what is on screen.
 ///
 /// The line *text* is the bulk of it. Style-only differences always travel with a
@@ -594,6 +1042,15 @@ fn fingerprint(app: &App) -> u64 {
     // Pane content changing behind the preview is a real reason to redraw, and
     // hashing the composed lines is how the loop learns about it.
     app.preview_lines.hash(&mut hasher);
+    // The panel is part of the screen, and a note added from another pane is
+    // exactly the kind of change the loop exists to notice. The cursor and the
+    // entry prompt travel separately: one is a background the text does not
+    // carry, the other owns the footer.
+    app.notes_view.plain.hash(&mut hasher);
+    app.notes_focus.hash(&mut hasher);
+    app.note_entry.hash(&mut hasher);
+    app.note_delete.hash(&mut hasher);
+    app.note_error.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -605,10 +1062,18 @@ pub fn run(
 ) -> io::Result<()> {
     let size = terminal.size()?;
     let mut app = App::new(surface, tmux_pane, (size.width, size.height));
+    // Resolved once, here, because resolving it reads a tmux option and the
+    // worker would otherwise pay for that on every pass. `None` on a popup turns
+    // the whole watch off.
+    app.notes_file = surface.shows_notes().then(notes::path);
+    if let Some(path) = &app.notes_file {
+        app.load_notes(&path.clone());
+    }
 
     let worker = worker::spawn(
         tmux::global_bool(tmux::CFG_AGENTS_ONLY, false),
         app.own_pane.clone(),
+        app.notes_file.clone(),
     );
     // Nothing to show until the first collection lands; ask for it now rather
     // than waiting out an interval.
@@ -631,6 +1096,9 @@ pub fn run(
             }
             // After the tree, so the pane it names is one this snapshot listed.
             app.apply_focus(snapshot.focused);
+            // Absent on every pass where the file did not move, which is almost
+            // all of them; see `Snapshot::notes`.
+            app.apply_notes(snapshot.notes);
             received = true;
         }
 
@@ -756,6 +1224,180 @@ mod tests {
         app.sessions = tree(panes);
         app.rebuild();
         app
+    }
+
+    /// An app with `count` notes in its scratchpad, rendered.
+    fn app_with_notes(count: usize, height: u16) -> App {
+        let mut app = app_with(vec![pane("%1", AgentState::Idle, true)], height);
+        app.notes = notes::NoteFile {
+            preamble: String::new(),
+            notes: (0..count)
+                .map(|index| notes::Note::new(&format!("note {index}"), ""))
+                .collect(),
+        };
+        app.rebuild();
+        app
+    }
+
+    // ─── notes panel ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_freshly_built_app_has_no_notes_of_its_own() {
+        // `new` must not read the developer's scratchpad, or every layout test in
+        // this file would depend on what they had written down that day.
+        let app = app_with(vec![pane("%1", AgentState::Idle, true)], 40);
+        assert!(app.notes.is_empty());
+        assert!(app.notes_view.is_empty());
+    }
+
+    #[test]
+    fn the_panel_takes_its_rows_out_of_the_list() {
+        let without = app_with_notes(0, 40).list_height();
+        let with = app_with_notes(3, 40).list_height();
+        assert_eq!(with, without - 4, "a header and three notes");
+    }
+
+    #[test]
+    fn the_composed_panel_is_exactly_as_tall_as_the_rows_it_was_given() {
+        // The rect and the lines are sized by the same call; if they can
+        // disagree, the panel either clips its last note or paints over the
+        // footer.
+        for count in [0usize, 1, 3, 40] {
+            for height in [10u16, 24, 40, 80] {
+                let app = app_with_notes(count, height);
+                let rows = ui::split_height(Surface::Sidebar, height, count);
+                assert_eq!(
+                    app.notes_view.lines.len(),
+                    rows.notes as usize,
+                    "{count} notes in {height} rows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_popup_composes_no_panel_however_many_notes_are_waiting() {
+        let mut app = surfaced_app(
+            Surface::Popup,
+            vec![pane("%1", AgentState::Idle, true)],
+            40,
+        );
+        app.notes = notes::NoteFile {
+            preamble: String::new(),
+            notes: (0..5).map(|_| notes::Note::new("x", "")).collect(),
+        };
+        app.rebuild();
+        assert!(app.notes_view.is_empty());
+        assert_eq!(app.list_height(), 38, "the popup keeps every body row");
+    }
+
+    #[test]
+    fn sh_quote_neutralises_everything_a_shell_would_act_on() {
+        // Both things interpolated into the popup command are attacker-adjacent:
+        // @agent_mgr_bin is user config, and a note id comes out of a markdown
+        // file that agents write. Validation already rejects a hostile id, but
+        // this is the layer that has to hold if validation is ever relaxed.
+        //
+        // Every payload here is inert on purpose. This test exists to catch a
+        // quoting regression, which means the failure mode is "the shell runs
+        // it" — so a realistic payload would delete a home directory or make a
+        // network call on the way to reporting the bug. The metacharacters are
+        // what matter; what they would have run does not.
+        for hostile in [
+            "x; printf INJECTED",
+            "$(printf INJECTED)",
+            "`printf INJECTED`",
+            "a'b",
+            "a\nb",
+            "| printf INJECTED",
+            "&& printf INJECTED",
+            "> /dev/null",
+        ] {
+            let quoted = sh_quote(hostile);
+            // Echoing it back through a real shell must yield the input verbatim.
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {quoted}"))
+                .output()
+                .expect("sh");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                hostile,
+                "{hostile:?} was not neutralised by {quoted}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_leaves_the_panel_alone() {
+        // `None` means "the file did not move", not "there are no notes". Reading
+        // it the other way would blank the panel once per interval — and since
+        // the panel's rows come out of the list, the whole sidebar would twitch.
+        let mut app = app_with_notes(3, 40);
+        let before = fingerprint(&app);
+        for _ in 0..3 {
+            app.apply_notes(None);
+            app.rebuild();
+        }
+        assert_eq!(app.notes.len(), 3);
+        assert_eq!(fingerprint(&app), before);
+    }
+
+    #[test]
+    fn a_snapshot_replaces_the_scratchpad_wholesale() {
+        let mut app = app_with_notes(1, 40);
+        app.apply_notes(Some(notes::NoteFile {
+            preamble: String::new(),
+            notes: vec![
+                notes::Note::new("from another pane", ""),
+                notes::Note::new("and another", ""),
+            ],
+        }));
+        app.rebuild();
+        assert_eq!(app.notes.len(), 2);
+        assert!(
+            app.notes_view.plain[1].contains("from another pane"),
+            "{:?}",
+            app.notes_view.plain
+        );
+    }
+
+    #[test]
+    fn a_scratchpad_that_shrank_pulls_the_scroll_offset_back() {
+        // Otherwise deleting notes elsewhere leaves the panel parked past the end,
+        // and it stays blank even after new notes arrive.
+        let mut app = app_with_notes(20, 40);
+        app.notes_scroll = 15;
+        app.apply_notes(Some(notes::NoteFile {
+            preamble: String::new(),
+            notes: vec![notes::Note::new("only one left", "")],
+        }));
+        app.rebuild();
+        assert_eq!(app.notes_scroll, 0);
+        assert!(app.notes_view.plain[1].contains("only one left"));
+    }
+
+    #[test]
+    fn fingerprint_moves_when_a_note_appears() {
+        // Otherwise the loop's change test cannot see the panel, and a note
+        // written from another pane never gets painted.
+        let mut app = app_with_notes(1, 40);
+        let before = fingerprint(&app);
+        app.notes.notes.push(notes::Note::new("something new", ""));
+        app.rebuild();
+        assert_ne!(fingerprint(&app), before);
+    }
+
+    #[test]
+    fn fingerprint_is_stable_while_the_scratchpad_is_untouched() {
+        // The zero-frames-when-idle promise: re-reading the same notes must not
+        // produce a new frame.
+        let mut app = app_with_notes(3, 40);
+        let first = fingerprint(&app);
+        for _ in 0..5 {
+            app.rebuild();
+            assert_eq!(fingerprint(&app), first);
+        }
     }
 
     // ─── filter ───────────────────────────────────────────────────────

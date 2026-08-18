@@ -110,6 +110,15 @@ pub const CFG_MAX_WIDTH: &str = "@agent_mgr_max_width";
 pub const CFG_POSITION: &str = "@agent_mgr_position";
 /// When `on`, list only panes running an agent instead of every pane.
 pub const CFG_AGENTS_ONLY: &str = "@agent_mgr_agents_only";
+/// Path to the global notes file. A leading `~/` is expanded; unset means the
+/// XDG default. Global rather than per-session on purpose — see [`crate::notes`].
+pub const CFG_NOTES_FILE: &str = "@agent_mgr_notes_file";
+/// Absolute path to the resolved `agent-mgr` binary, published by
+/// `tmux-agent-mgr.tmux` at load. The conf's key bindings read it, `hook.sh`
+/// reads it, and the notes overlay reads it to build the `display-popup`
+/// command — asking tmux on every use is what lets the binary be rebuilt or
+/// relocated without regenerating the agent's hook config.
+pub const CFG_BIN: &str = "@agent_mgr_bin";
 // These two are consumed only by `agent-mgr.conf` — the tab glyph is appended to
 // `window-status-format` and the nav keys are bound, both in tmux config rather
 // than in Rust. They are declared here so the option surface lives in one place,
@@ -138,11 +147,6 @@ pub mod conf_only {
     /// the user already set, so it is named here to keep the whole option surface
     /// in one place and to let a test check the conf still writes it.
     pub const RESURRECT_HOOK: &str = "@resurrect-hook-post-restore-all";
-    /// Absolute path to the resolved `agent-mgr` binary, published by
-    /// `tmux-agent-mgr.tmux` at load. The conf's key bindings read it, and so
-    /// does `hook.sh` — asking tmux on every fire is what lets the binary be
-    /// rebuilt or relocated without regenerating the agent's hook config.
-    pub const BIN: &str = "@agent_mgr_bin";
     /// Whether this tmux can host the popup surface (`display-popup -B -E`,
     /// tmux >= 3.3). Written by `tmux-agent-mgr.tmux` at load, read by the conf to
     /// decide whether binding the popup key would produce a working key or one
@@ -232,6 +236,7 @@ mod tests {
             CFG_MAX_WIDTH,
             CFG_POSITION,
             CFG_AGENTS_ONLY,
+            CFG_NOTES_FILE,
             conf_only::CFG_TAB_STATUS,
             conf_only::CFG_NAV,
             conf_only::CFG_KEY,
@@ -241,7 +246,7 @@ mod tests {
             conf_only::CFG_RESURRECT,
             conf_only::RESURRECT_HOOK,
             conf_only::HAS_POPUP,
-            conf_only::BIN,
+            CFG_BIN,
         ] {
             assert!(
                 SHIPPED_CONF.contains(key),
@@ -255,9 +260,9 @@ mod tests {
         // `hook.sh` and every key binding resolve the binary through this option,
         // so the entry point renaming it would break all three at once.
         assert!(
-            SHIPPED_TMUX.contains(conf_only::BIN),
+            SHIPPED_TMUX.contains(CFG_BIN),
             "tmux-agent-mgr.tmux must publish {}",
-            conf_only::BIN
+            CFG_BIN
         );
     }
 

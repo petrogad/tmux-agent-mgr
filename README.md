@@ -105,6 +105,8 @@ moving through the panes of one window is something you can see.
 | `/` | search; `Enter` keeps the filter, `Esc` clears it |
 | `R` | rename the selected window |
 | `r` | refresh now |
+| `a` | jot down a note |
+| `n` | give the notes panel the keyboard |
 | `?` | keymap |
 | `q` `Esc` | close |
 
@@ -115,6 +117,94 @@ that session first, then to the session above.
 Search matches a pane's session, window, command, git branch, worktree and agent
 name, so `ops`, `claude` and `auth` all find what you'd expect. Terms are ANDed, and
 it composes with the status filter rather than replacing it.
+
+### Notes
+
+A scratchpad at the bottom of the sidebar, for the thing you notice about *another*
+project while you're deep in this one. It is global — not per-pane, not per-session —
+because the whole point is getting something out of your head without first working
+out where it belongs.
+
+`a` opens a prompt from anywhere in the sidebar; `n` hands the panel the keyboard.
+
+| Key | | |
+|---|---|---|
+| `a` | anywhere | write a note |
+| `n` | in the list | focus the panel |
+| `j` `k` `g` `G` | in the panel | move between notes |
+| `Space` | in the panel | mark done |
+| `Enter` | in the panel | read the full note in a popup |
+| `e` | in the panel | open the note in `$EDITOR` |
+| `d` | in the panel | delete it, after a `y/n` confirmation |
+| `n` `q` `Esc` | in the panel | back to the list |
+
+`a` is for getting a title down fast; `e` is where the body gets written, in your
+own editor, in the markdown the file is already made of. Both popups are centred over
+the window. `d` names the note it is about to delete and only `y` goes ahead — there
+is no undo, the file is the only copy. Emptying a note in the editor and saving
+deletes it too.
+
+`e` runs `$VISUAL`, then `$EDITOR`, then falls back to `vi`. Worth setting, because
+`vi` with no config is a rough place to land unexpectedly. One tmux wrinkle: a popup
+gets the **server's** environment, not your shell's, so exporting it in your profile
+only reaches servers started afterwards — `tmux set-environment -g EDITOR <yours>`
+fixes one that is already running.
+
+The panel is a mode, so `Space` marks a note done while it still jumps to a pane one
+row above. It takes at most a quarter of the sidebar and at most 12 rows, shrinks to
+however many notes you have, never leaves the pane list under 6 rows, and disappears
+entirely when the scratchpad is empty.
+
+Notes live in one markdown file — `${XDG_DATA_HOME:-~/.local/share}/tmux-agent-mgr/notes.md`,
+or wherever `@agent_mgr_notes_file` points:
+
+````markdown
+## [ ] auth redirect drops ?next
+<!-- id=dkkrw2aliwa0i82 t=1770000000 from=blueberry:3 -->
+The 302 out of /callback loses the `next` param.
+
+## Repro
+
+1. log out
+2. hit a protected route
+3. land on `/` instead
+
+```sh
+curl -i localhost:3000/callback
+```
+
+## [x] starship timeout
+Raised to 1500ms.
+````
+
+The sidebar shows titles; everything under one is its body, and `Enter` is how you
+read it. **A note heading is `## ` plus a checkbox, and nothing else is** — so a body
+can use any markdown it likes, `##` sections included, without a subsection becoming
+the next note.
+
+Markdown rather than a private format because you are not the only writer: edit it in
+`$EDITOR`, or point an agent at it. The panel notices within a second either way, and
+nothing here addresses a note by position — every action finds its note by `id=`, so
+another pane adding or deleting one while you are mid-edit cannot redirect it.
+
+`id=` is the one reserved key. It is written for you, it must stay lowercase
+alphanumeric, and a value that isn't gets replaced on the next write rather than kept
+— an id you can retype is not an identity. Every other key in that comment is yours
+and is preserved untouched. From a shell:
+
+```sh
+agent-mgr note add "auth redirect drops ?next"
+agent-mgr note add "check the fence case" --body -   # body on stdin
+agent-mgr note list                    # index, open/done, id, title
+agent-mgr note show 1
+agent-mgr note edit 1                  # $EDITOR; this is what `e` runs in the popup
+agent-mgr note edit --id=dkkrw2aliwa0i82
+```
+
+An index is fine when you read it from `note list` and use it a second later.
+Anything that holds a reference across time — a script, a hook, an agent — should
+use `--id`, because a deletion from another pane renumbers everything below it. The
+sidebar always uses ids for exactly that reason.
 
 ### Reading a row
 
@@ -177,6 +267,7 @@ Set these **before** the plugin loads; it only fills in what you haven't.
 | `@agent_mgr_key_all` | `E` | prefix key toggling it everywhere |
 | `@agent_mgr_key_focus` | `o` | prefix key jumping into the sidebar and back; `none` binds nothing |
 | `@agent_mgr_key_popup` | `C-n` | prefix-less popup key; `none` binds nothing |
+| `@agent_mgr_notes_file` | *XDG default* | where the scratchpad lives; a leading `~/` is expanded |
 
 Colors take a `#RRGGBB` or a 0–255 palette index:
 `@agent_mgr_color_{accent,session,working,blocked,idle,done,error,branch}`.

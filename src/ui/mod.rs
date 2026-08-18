@@ -1,6 +1,8 @@
-//! Drawing the sidebar: a header, the scrollable list, and a footer.
+//! Drawing the sidebar: a header, the scrollable list, the notes panel, and a
+//! footer.
 
 pub mod help;
+pub mod notes;
 pub mod rows;
 pub mod text;
 pub mod theme;
@@ -48,6 +50,17 @@ impl Surface {
     pub fn shows_preview(self) -> bool {
         self == Self::Popup
     }
+
+    /// Whether this surface carries the notes panel.
+    ///
+    /// The sidebar only. A popup is up for seconds to answer one question and
+    /// already spends its width on the preview; putting a scratchpad in it would
+    /// be showing you notes at the one moment you are certain not to be writing
+    /// any. It is also the surface with no persistence — a panel you cannot
+    /// leave open is not a panel.
+    pub fn shows_notes(self) -> bool {
+        self == Self::Sidebar
+    }
 }
 
 /// Columns given to the list when a preview shares the width.
@@ -75,7 +88,9 @@ pub fn split_width(surface: Surface, total_width: u16) -> (u16, Option<u16>) {
 pub fn preview_area(surface: Surface, size: (u16, u16)) -> Option<crate::preview::Rect> {
     let (_, preview_width) = split_width(surface, size.0);
     let width = preview_width? as usize;
-    let height = list_height(size.1) as usize;
+    // A note count of zero, because only a popup has a preview and only a
+    // sidebar has notes — see `the_popup_surface_has_no_notes_panel`.
+    let height = split_height(surface, size.1, 0).list as usize;
     (width > 0 && height > 0).then_some(crate::preview::Rect {
         x: 0,
         y: 0,
@@ -89,9 +104,70 @@ pub fn preview_area(surface: Surface, size: (u16, u16)) -> Option<crate::preview
 pub const HEADER_HEIGHT: u16 = 1;
 pub const FOOTER_HEIGHT: u16 = 1;
 
-/// Visible list height for a pane of `total_height` rows.
-pub fn list_height(total_height: u16) -> u16 {
-    total_height.saturating_sub(HEADER_HEIGHT + FOOTER_HEIGHT)
+/// Share of the pane the notes panel may take, as a divisor — a quarter.
+///
+/// A proportion rather than a fixed row count so the panel is worth having on a
+/// tall pane without dominating a short one. It is a *ceiling*, not a
+/// reservation: the panel shrinks to the notes it actually has, so the common
+/// case of two or three notes costs three or four rows however tall the pane is.
+const NOTES_SHARE: u16 = 4;
+/// Beyond this the panel stops being a glance and starts being a document, which
+/// is the overlay's job. Bounds the quarter on a very tall pane.
+const NOTES_MAX_HEIGHT: u16 = 12;
+/// Rows the pane list keeps whatever the notes do. The list is what the plugin
+/// is *for*; a scratchpad that can squeeze the agents off screen has its
+/// priorities backwards.
+const MIN_LIST_HEIGHT: u16 = 6;
+/// A header with no room for even one note is pure cost, so the panel collapses
+/// instead.
+const NOTES_MIN_HEIGHT: u16 = 2;
+
+/// How a pane's rows divide between the list and the notes panel.
+///
+/// The vertical counterpart to [`split_width`], and returned together for the
+/// same reason: the two numbers are only correct relative to each other, so a
+/// caller must not be able to compute one without the other.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct Rows {
+    pub list: u16,
+    /// Rows for the notes panel, its own header included. Zero when the surface
+    /// has no panel, when there are no notes, or when the pane is too short to
+    /// spare them.
+    pub notes: u16,
+}
+
+/// Split a pane of `total_height` rows into a list and a notes panel.
+///
+/// Header and footer come off the top first — both are fixed, which is what
+/// keeps the list viewport stable — and the notes panel is carved out of what
+/// remains, directly above the footer.
+pub fn split_height(surface: Surface, total_height: u16, note_count: usize) -> Rows {
+    let body = total_height.saturating_sub(HEADER_HEIGHT + FOOTER_HEIGHT);
+    let notes = notes_height(surface, total_height, note_count);
+    Rows {
+        list: body.saturating_sub(notes),
+        notes,
+    }
+}
+
+/// Rows the notes panel takes, before the list is given the rest.
+fn notes_height(surface: Surface, total_height: u16, note_count: usize) -> u16 {
+    if !surface.shows_notes() || note_count == 0 {
+        return 0;
+    }
+    let body = total_height.saturating_sub(HEADER_HEIGHT + FOOTER_HEIGHT);
+    // A quarter of the *pane*, not of the body, so the panel doesn't grow as the
+    // header and footer become a smaller share of a taller pane.
+    let share = (total_height / NOTES_SHARE).min(NOTES_MAX_HEIGHT);
+    // One row per note plus the panel's own header. Taking the smaller of this
+    // and the share is what stops a single note reserving a quarter of the pane
+    // to show blank rows.
+    let wanted = u16::try_from(note_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
+    let spare = body.saturating_sub(MIN_LIST_HEIGHT);
+    let height = share.min(wanted).min(spare);
+    if height < NOTES_MIN_HEIGHT { 0 } else { height }
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -104,7 +180,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(header_line(app, area.width as usize)), header);
 
     let (list_width, preview_width) = split_width(app.surface, area.width);
-    let list_rows = list_height(area.height);
+    let rows = split_height(app.surface, area.height, app.notes.len());
+    let list_rows = rows.list;
 
     if let Some(preview_width) = preview_width
         && list_rows > 0
@@ -141,6 +218,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .collect();
             frame.render_widget(Paragraph::new(visible), list);
         }
+    }
+
+    // Between the list and the footer: near the thing you are looking at, but
+    // out of the way of the rows that move.
+    if rows.notes > 0 && !app.notes_view.is_empty() {
+        let panel = Rect {
+            y: area.y + HEADER_HEIGHT + list_rows,
+            width: list_width,
+            height: rows.notes,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(app.notes_view.lines.clone()), panel);
     }
 
     if area.height > HEADER_HEIGHT {
@@ -217,6 +306,24 @@ fn filter_label(filter: StatusFilter) -> &'static str {
     }
 }
 
+/// The footer as plain text, for tests that care what actually reached the
+/// screen rather than what was merely computed.
+///
+/// Several things compete for this one line, and only the first match renders.
+/// Asserting on the state behind them cannot tell a message that is shown from
+/// one that is shadowed by a prompt above it — which is exactly how a failed
+/// write once set an error nobody ever saw.
+#[cfg(test)]
+pub fn footer_text(app: &App, total_width: usize) -> String {
+    footer_line(app, total_width)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
 /// The footer carries the active filter and, when it is hiding panes, how many.
 /// A filter you forgot you set is the classic "why is my agent missing" bug.
 fn footer_line(app: &App, total_width: usize) -> Line<'static> {
@@ -228,6 +335,29 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     // says what it is renaming rather than showing a bare text box.
     if let Some(rename) = &app.rename {
         return prompt_line("rename: ", &rename.name, total_width, theme.accent, true);
+    }
+    // Above the count and the search, because it is a prompt with the keyboard
+    // and those two are only echoes of state.
+    // Above the prompts, not below them. A failed write restores the entry
+    // prompt *and* sets this, so an error checked second is an error the user
+    // never sees — it is cleared by the next key having only ever been computed.
+    if let Some(error) = &app.note_error {
+        return prompt_line("", error, total_width, theme.error, false);
+    }
+    if let Some(entry) = &app.note_entry {
+        return prompt_line("note: ", entry, total_width, theme.accent, true);
+    }
+    // Named, so you are not answering a bare "delete? y/n" and having to look
+    // back up at the cursor to work out what about. In the error colour because
+    // it is the one action here with no undo.
+    if let Some(note) = &app.note_delete {
+        return prompt_line(
+            "delete ",
+            &format!("{:?}? y/n", note.title),
+            total_width,
+            theme.error,
+            false,
+        );
     }
     // A half-typed count has to be visible: without an echo you cannot tell a
     // pending `1` from a keystroke that was dropped, and you find out only by
@@ -283,7 +413,7 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
 /// previous one instead of leaving its bottom rows on screen — the one place a
 /// stale row would otherwise survive, since we never clear.
 fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let height = list_height(app.size.1) as usize;
+    let height = app.list_height();
     (0..height)
         .map(|row| match app.preview_lines.get(row) {
             Some(line) => Line::from(
@@ -492,15 +622,118 @@ mod tests {
         assert!(preview_area(Surface::Popup, (200, 2)).is_none(), "no rows");
         let area = preview_area(Surface::Popup, (200, 50)).unwrap();
         assert_eq!(area.width, (200 - LIST_WIDTH) as usize);
-        assert_eq!(area.height, list_height(50) as usize);
+        assert_eq!(area.height, split_height(Surface::Popup, 50, 0).list as usize);
     }
 
     #[test]
     fn list_height_reserves_the_header_and_footer_without_underflowing() {
-        assert_eq!(list_height(40), 38);
-        assert_eq!(list_height(2), 0);
-        assert_eq!(list_height(1), 0);
-        assert_eq!(list_height(0), 0);
+        for height in [40, 2, 1, 0] {
+            let expected = height.max(2) - 2;
+            let expected = if height < 2 { 0 } else { expected };
+            assert_eq!(split_height(Surface::Sidebar, height, 0).list, expected);
+        }
+    }
+
+    // ─── the notes panel ──────────────────────────────────────────────
+
+    #[test]
+    fn the_popup_surface_has_no_notes_panel() {
+        // A popup is up for seconds and already spends its width on the preview.
+        // This is also what lets `preview_area` pass a note count of zero.
+        for count in [0, 1, 5, 100] {
+            for height in [10, 40, 200] {
+                assert_eq!(split_height(Surface::Popup, height, count).notes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_scratchpad_gives_every_row_back() {
+        // The panel is not a permanent tax on the sidebar: with nothing written
+        // down, the list is exactly as tall as it was before the feature.
+        for height in 0..=200u16 {
+            let rows = split_height(Surface::Sidebar, height, 0);
+            assert_eq!(rows.notes, 0, "at height {height}");
+            assert_eq!(
+                rows.list,
+                height.saturating_sub(HEADER_HEIGHT + FOOTER_HEIGHT),
+                "at height {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_notes_panel_never_starves_the_pane_list() {
+        // The list is what the plugin is for. Whatever the pane height and
+        // however many notes are waiting, the agents stay on screen.
+        for height in 0..=200u16 {
+            for count in [1usize, 2, 5, 40, 1000] {
+                let rows = split_height(Surface::Sidebar, height, count);
+                let body = height.saturating_sub(HEADER_HEIGHT + FOOTER_HEIGHT);
+                assert_eq!(rows.list + rows.notes, body, "at {height}×{count}");
+                assert!(
+                    rows.notes == 0 || rows.list >= MIN_LIST_HEIGHT,
+                    "at {height}×{count}: notes {} left only {} list rows",
+                    rows.notes,
+                    rows.list
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_pane_drops_the_panel_rather_than_squeezing_it() {
+        // Two rows is a header and one note; anything less is a header labelling
+        // nothing, which costs a row to say nothing.
+        for height in 0..=(HEADER_HEIGHT + FOOTER_HEIGHT + MIN_LIST_HEIGHT) {
+            assert_eq!(
+                split_height(Surface::Sidebar, height, 5).notes,
+                0,
+                "at height {height}"
+            );
+        }
+        let first = HEADER_HEIGHT + FOOTER_HEIGHT + MIN_LIST_HEIGHT + NOTES_MIN_HEIGHT;
+        assert_eq!(split_height(Surface::Sidebar, first, 5).notes, NOTES_MIN_HEIGHT);
+    }
+
+    #[test]
+    fn the_panel_shrinks_to_the_notes_it_has() {
+        // A quarter of a tall pane is the ceiling, not a reservation: one note
+        // must not buy ten blank rows.
+        let rows = split_height(Surface::Sidebar, 80, 1);
+        assert_eq!(rows.notes, 2, "a header and the one note");
+        assert_eq!(split_height(Surface::Sidebar, 80, 3).notes, 4);
+    }
+
+    #[test]
+    fn the_panel_takes_at_most_a_quarter_of_the_pane() {
+        // With more notes than rows the panel stops at its share and scrolls,
+        // rather than turning the sidebar into a to-do list with an agent list
+        // attached.
+        for height in [20u16, 40, 60, 100, 200] {
+            let notes = split_height(Surface::Sidebar, height, 1000).notes;
+            assert!(
+                notes <= height / NOTES_SHARE,
+                "at height {height}: {notes} rows is more than a quarter"
+            );
+            assert!(notes <= NOTES_MAX_HEIGHT, "at height {height}");
+        }
+    }
+
+    #[test]
+    fn a_very_tall_pane_stops_growing_the_panel() {
+        // Past a dozen rows the panel is a document, and reading a document is
+        // what the detail overlay is for.
+        assert_eq!(split_height(Surface::Sidebar, 400, 1000).notes, NOTES_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn an_absurd_note_count_does_not_overflow_the_row_split() {
+        // `usize` notes into a `u16` of rows: the cast has to saturate, not wrap
+        // to a tiny panel.
+        let rows = split_height(Surface::Sidebar, 40, usize::MAX);
+        assert_eq!(rows.notes, (40 / NOTES_SHARE).min(NOTES_MAX_HEIGHT));
+        assert_eq!(rows.list + rows.notes, 38);
     }
 
     // ─── preview styling ──────────────────────────────────────────────
