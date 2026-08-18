@@ -139,10 +139,16 @@ out where it belongs.
 | `n` `q` `Esc` | in the panel | back to the list |
 
 `a` is for getting a title down fast; `e` is where the body gets written, in your
-own editor, in the markdown the file is already made of. Both popups are centred
-over the window. `d` names the note it is about to delete and only `y` goes ahead —
-there is no undo, the file is the only copy. Emptying a note in the editor and saving
+own editor, in the markdown the file is already made of. Both popups are centred over
+the window. `d` names the note it is about to delete and only `y` goes ahead — there
+is no undo, the file is the only copy. Emptying a note in the editor and saving
 deletes it too.
+
+`e` runs `$VISUAL`, then `$EDITOR`, then falls back to `vi`. Worth setting, because
+`vi` with no config is a rough place to land unexpectedly. One tmux wrinkle: a popup
+gets the **server's** environment, not your shell's, so exporting it in your profile
+only reaches servers started afterwards — `tmux set-environment -g EDITOR <yours>`
+fixes one that is already running.
 
 The panel is a mode, so `Space` marks a note done while it still jumps to a pane one
 row above. It takes at most a quarter of the sidebar and at most 12 rows, shrinks to
