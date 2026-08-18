@@ -99,7 +99,7 @@ fn is_claude_version_name(name: &str) -> bool {
 pub fn state_from_title(agent: AgentKind, title: &str) -> Option<AgentState> {
     let title = title.trim();
     match agent {
-        AgentKind::Claude if starts_with_braille_spinner(title) => Some(AgentState::Working),
+        AgentKind::Claude if starts_with_spinner(title) => Some(AgentState::Working),
         // Claude's idle title (`✳ …`) looks the same whether or not a modal is
         // on screen, so it is never conclusive by itself.
         //
@@ -190,8 +190,18 @@ fn claude_state(evidence: &AgentEvidence) -> AgentState {
         return AgentState::Blocked;
     }
 
-    // Working: Claude prefixes its OSC title with a braille spinner while active.
-    if starts_with_braille_spinner(title) {
+    // Working: Claude prefixes its OSC title with a spinner frame while active.
+    if starts_with_spinner(title) {
+        return AgentState::Working;
+    }
+
+    // The same question asked of the screen, for when the title says nothing
+    // useful: a spinner glyph we do not know yet, or a terminal that never
+    // delivered the OSC at all. Claude only offers the interrupt hint mid-turn
+    // — its idle footer carries the permission-mode hint alone — and the hint
+    // is transient rather than left behind in the transcript, so the same
+    // string that reads Codex reads Claude.
+    if recent.to_lowercase().contains("esc to interrupt") {
         return AgentState::Working;
     }
 
@@ -257,12 +267,30 @@ fn recent_lines(text: &str, count: usize) -> String {
     all[start..].join("\n")
 }
 
-/// Both agents advertise activity by prefixing their OSC title with a braille
-/// spinner frame followed by a space.
-fn starts_with_braille_spinner(value: &str) -> bool {
+/// Claude advertises activity by prefixing its OSC title with a spinner frame
+/// followed by a space. *Which* frames it cycles through is not stable across
+/// releases: braille (`⠋`) held for a long time, and 2.1.235 sets `◐ `
+/// instead. Accepting every family it has used, rather than only the one that
+/// happened to ship when this was written, is what keeps an upgrade from
+/// silently pinning every Claude pane to idle — which is exactly what 2.1.235
+/// did.
+///
+/// Deliberately *not* a catch-all "any non-ASCII leader": Claude's idle title
+/// starts with `✳ `, so a blanket rule would read idle as working.
+fn starts_with_spinner(value: &str) -> bool {
     let mut chars = value.chars();
-    matches!(chars.next(), Some(ch) if ('\u{2800}'..='\u{28ff}').contains(&ch))
-        && matches!(chars.next(), Some(' '))
+    matches!(chars.next(), Some(ch) if is_spinner_frame(ch)) && matches!(chars.next(), Some(' '))
+}
+
+/// A single spinner frame: braille, or one of the geometric-shape animations
+/// (part-filled circles and squares) that terminal spinners commonly cycle.
+fn is_spinner_frame(ch: char) -> bool {
+    matches!(ch,
+        '\u{2800}'..='\u{28ff}'   // braille patterns
+        | '\u{25cb}'..='\u{25d7}' // ○ ◌ ◍ ◎ ● ◐ ◑ ◒ ◓ ◔ ◕ ◖ ◗
+        | '\u{25e0}'..='\u{25e5}' // ◠ ◡ ◢ ◣ ◤ ◥
+        | '\u{25f0}'..='\u{25ff}' // ◰ ◱ ◲ ◳ ◴ ◵ ◶ ◷
+    )
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -565,10 +593,58 @@ mod tests {
     }
 
     #[test]
-    fn a_braille_glyph_without_a_trailing_space_is_not_a_spinner() {
-        assert!(starts_with_braille_spinner("⠋ thinking"));
-        assert!(!starts_with_braille_spinner("⠋thinking"));
-        assert!(!starts_with_braille_spinner("thinking ⠋"));
-        assert!(!starts_with_braille_spinner(""));
+    fn a_spinner_glyph_without_a_trailing_space_is_not_a_spinner() {
+        assert!(starts_with_spinner("⠋ thinking"));
+        assert!(!starts_with_spinner("⠋thinking"));
+        assert!(!starts_with_spinner("thinking ⠋"));
+        assert!(!starts_with_spinner(""));
+    }
+
+    /// Claude 2.1.235 swapped its title spinner from braille to `◐`. Both
+    /// families have to read as working, and the idle `✳` must not.
+    #[test]
+    fn reads_every_claude_spinner_family_as_working() {
+        for frame in ['◐', '◑', '◒', '◓', '◴', '⠋'] {
+            let title = format!("{frame} Spinner not appearing in tmux");
+            assert!(starts_with_spinner(&title), "{title} should read as working");
+            assert_eq!(
+                state_from_title(AgentKind::Claude, &title),
+                Some(AgentState::Working),
+            );
+        }
+        assert!(!starts_with_spinner("✳ Spinner not appearing in tmux"));
+        assert_eq!(
+            state_from_title(AgentKind::Claude, "✳ Spinner not appearing in tmux"),
+            None,
+        );
+    }
+
+    /// The title is not the only witness: a glyph family we have not seen yet
+    /// still leaves the interrupt hint on screen.
+    #[test]
+    fn reads_claudes_interrupt_hint_as_working_when_the_title_is_unhelpful() {
+        let working = evidence(
+            "✳ some task",
+            &[
+                "❯ ",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents",
+            ],
+        );
+        assert_eq!(
+            state_from_evidence(AgentKind::Claude, &working),
+            AgentState::Working
+        );
+
+        let idle = evidence(
+            "✳ some task",
+            &[
+                "❯ ",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            ],
+        );
+        assert_eq!(
+            state_from_evidence(AgentKind::Claude, &idle),
+            AgentState::Idle
+        );
     }
 }
