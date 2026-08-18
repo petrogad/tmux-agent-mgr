@@ -260,6 +260,7 @@ Set these **before** the plugin loads; it only fills in what you haven't.
 | `@agent_mgr_max_width` | *unset* | upper clamp; unset means uncapped |
 | `@agent_mgr_position` | `left` | `left` or `right` |
 | `@agent_mgr_agents_only` | `off` | list only panes running an agent |
+| `@agent_mgr_resurrect` | `on` | re-open sidebars after a tmux-resurrect restore |
 | `@agent_mgr_tab_status` | `on` | status glyph in window tabs |
 | `@agent_mgr_nav` | `on` | the `C-h/j/k/l` bindings above |
 | `@agent_mgr_key` | `e` | prefix key toggling the sidebar here |
@@ -276,6 +277,20 @@ set -g @agent_mgr_position right
 set -g @agent_mgr_width 28
 set -g @agent_mgr_color_accent '#89b4fa'
 ```
+
+### With tmux-resurrect / tmux-continuum
+
+Sidebars come back with your sessions, at the width and position they had. Nothing to
+configure — the plugin appends `agent-mgr restore` to resurrect's
+`@resurrect-hook-post-restore-all`, keeping whatever you already had in it. Turn it
+off with `set -g @agent_mgr_resurrect off`.
+
+Don't bother adding the sidebar to `@resurrect-processes` — it cannot work. resurrect
+finds a pane's program by looking at the *children* of the pane's process, and the
+sidebar has none, because it **is** the pane's process. So resurrect saves no command
+for it and skips it on restore, whatever that option says. Restoring the pane is the
+part resurrect gets right; only the program needs putting back, which is all
+`agent-mgr restore` does.
 
 ## How it works
 

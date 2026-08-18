@@ -35,6 +35,7 @@ pub fn cmd_toggle(args: &[&str]) -> i32 {
 
     if let Some(existing) = find_sidebar_pane(window_id) {
         tmux::run_tmux_quiet(&["kill-pane", "-t", &existing]);
+        clear_window_rename(window_id);
         return 0;
     }
 
@@ -81,11 +82,12 @@ pub fn cmd_focus(args: &[&str]) -> i32 {
 /// silently move where you land in each of them.
 pub fn cmd_toggle_all(args: &[&str]) -> i32 {
     let initiator = args.first().copied().unwrap_or_default();
-    let listing = tmux::run_tmux(&["list-panes", "-a", "-F", &pane_role_format()]).unwrap_or_default();
+    let listing = tmux::run_tmux(&["list-panes", "-a", "-F", &sidebar_kill_format()]).unwrap_or_default();
 
-    if let Some(panes) = sidebar_panes(&listing) {
-        for pane_id in panes {
+    if let Some(sidebars) = sidebar_panes_with_windows(&listing) {
+        for (pane_id, window_id) in sidebars {
             tmux::run_tmux_quiet(&["kill-pane", "-t", &pane_id]);
+            clear_window_rename(&window_id);
         }
         return 0;
     }
@@ -242,6 +244,9 @@ fn create_sidebar(window_id: &str, pane_path: &str, focus: Focus) {
         // Tag it immediately: this is how the TUI excludes itself from its own
         // list and how a later toggle finds the pane to kill.
         tmux::set_pane_option_raw(&sidebar, tmux::PANE_ROLE, tmux::PANE_ROLE_SIDEBAR);
+        // With `automatic-rename on`, a focused sidebar would otherwise rename the
+        // tab to our binary. Guard the window so the sidebar keeps the name.
+        guard_window_rename(window_id);
     }
 
     if focus == Focus::Unchanged {
@@ -352,6 +357,73 @@ fn should_kill_window(
 
 fn pane_role_format() -> String {
     format!("#{{pane_id}}\t#{{{}}}", tmux::PANE_ROLE)
+}
+
+/// tmux's built-in window option naming a window after its active pane's command
+/// when `automatic-rename` is on. While a sidebar is present we override it
+/// per-window so focusing the sidebar does not rename the tab to our binary.
+const AUTOMATIC_RENAME_FORMAT: &str = "automatic-rename-format";
+
+/// Wrap `effective` so a focused sidebar pane keeps the window's current name,
+/// while every other pane still auto-names by `effective`. The active pane is in
+/// context when tmux expands this, so it can read the sidebar role tag.
+fn rename_guard_format(effective: &str) -> String {
+    format!(
+        "#{{?#{{==:#{{{role}}},{sidebar}}},#{{window_name}},{effective}}}",
+        role = tmux::PANE_ROLE,
+        sidebar = tmux::PANE_ROLE_SIDEBAR,
+    )
+}
+
+/// Read the effective global `automatic-rename-format` so a user's custom format
+/// survives for ordinary panes. tmux reports its built-in default here when the
+/// option is unset, so the fallback is only reached if the query itself fails.
+fn effective_rename_format() -> String {
+    let value = tmux::run_tmux(&["show-options", "-gwv", AUTOMATIC_RENAME_FORMAT])
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    if value.is_empty() {
+        "#{pane_current_command}".to_owned()
+    } else {
+        value
+    }
+}
+
+/// Guard `window_id`'s tab against the sidebar renaming it. Composes the user's
+/// effective format into the else-branch so their customization is preserved.
+fn guard_window_rename(window_id: &str) {
+    let format = rename_guard_format(&effective_rename_format());
+    let _ = tmux::set_window_option(window_id, AUTOMATIC_RENAME_FORMAT, &format);
+}
+
+/// Drop the per-window guard so the window re-inherits the global format once its
+/// sidebar is gone; otherwise a later change to the global would be shadowed by
+/// the copy baked in at creation.
+fn clear_window_rename(window_id: &str) {
+    let _ = tmux::unset_window_option(window_id, AUTOMATIC_RENAME_FORMAT);
+}
+
+/// `#{pane_id}\t#{window_id}\t#{@agent_mgr_pane_role}` — like [`pane_role_format`]
+/// but carrying the window id, so a server-wide teardown can clear each sidebar's
+/// window guard as it kills the pane.
+fn sidebar_kill_format() -> String {
+    format!("#{{pane_id}}\t#{{window_id}}\t#{{{}}}", tmux::PANE_ROLE)
+}
+
+/// `(pane_id, window_id)` for every sidebar in [`sidebar_kill_format`] output, or
+/// `None` when there are none — so callers distinguish "turn them off" from "on".
+fn sidebar_panes_with_windows(listing: &str) -> Option<Vec<(String, String)>> {
+    let panes: Vec<(String, String)> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let pane_id = fields.next()?;
+            let window_id = fields.next()?;
+            let role = fields.next()?;
+            (role == tmux::PANE_ROLE_SIDEBAR).then(|| (pane_id.to_owned(), window_id.to_owned()))
+        })
+        .collect();
+    (!panes.is_empty()).then_some(panes)
 }
 
 /// Extract sidebar pane ids from `pane_role_format` output. `None` when there
@@ -606,6 +678,44 @@ mod tests {
         );
         assert_eq!(sidebar_panes("%1\t\n%2\t"), None);
         assert_eq!(sidebar_panes(""), None);
+    }
+
+    #[test]
+    fn sidebar_panes_with_windows_pairs_each_sidebar_with_its_window() {
+        // The window id is what lets a server-wide toggle-off clear each
+        // sidebar's per-window rename guard as it kills the pane.
+        assert_eq!(
+            sidebar_panes_with_windows("%1\t@1\t\n%2\t@1\tsidebar\n%3\t@2\tsidebar"),
+            Some(vec![
+                ("%2".to_owned(), "@1".to_owned()),
+                ("%3".to_owned(), "@2".to_owned()),
+            ])
+        );
+        assert_eq!(sidebar_panes_with_windows("%1\t@1\t\n%2\t@1\t"), None);
+        assert_eq!(sidebar_panes_with_windows(""), None);
+    }
+
+    // ─── the automatic-rename guard ───────────────────────────────────
+
+    #[test]
+    fn the_rename_guard_keeps_the_window_name_only_for_the_sidebar_pane() {
+        // Focused sidebar → #{window_name} (tab unchanged); any other pane → the
+        // effective format, so ordinary panes auto-name exactly as before. This
+        // is what stops `automatic-rename` retitling the tab to our binary.
+        assert_eq!(
+            rename_guard_format("#{pane_current_command}"),
+            "#{?#{==:#{@agent_mgr_pane_role},sidebar},#{window_name},#{pane_current_command}}"
+        );
+    }
+
+    #[test]
+    fn the_rename_guard_preserves_a_user_custom_format_for_normal_panes() {
+        // A user's custom global format is composed verbatim into the else-branch
+        // rather than overwritten, so their naming survives outside the sidebar.
+        assert_eq!(
+            rename_guard_format("#{b:pane_current_path}"),
+            "#{?#{==:#{@agent_mgr_pane_role},sidebar},#{window_name},#{b:pane_current_path}}"
+        );
     }
 
     #[test]

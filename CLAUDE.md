@@ -87,6 +87,8 @@ daemon.rs      one poller per tmux server: precedence, directional debounce, run
 hook/mod.rs    `hook <agent> <event>`: stdin JSON, pane state read, apply writes.
 hook/claude.rs the Claude Code mapping. Pure: plan(event, payload, state, now).
 git.rs         branch + worktree for a path, TTL-cached including negative results.
+resurrect.rs   `restore`: read tmux-resurrect's own snapshot, respawn the binary
+               into the panes that were sidebars. Snapshot parsing is pure.
 pane.rs        sidebar pane lifecycle: resolve_width's clamp order, which side the
                split lands on, should_kill_window's multi-client guard, and who
                takes focus on open (Focus, focus_action).
@@ -239,6 +241,32 @@ Most bugs in this plugin have lived here, not in the Rust.
   feature silently does nothing. Use `sed`.
 - **tmux has no "replace this hook" verb.** Our hooks are removed before being
   re-added, or a config reload stacks another copy and fires them N times.
+- **`respawn-pane -k` keeps the pane's index and width and does *not* fire
+  `pane-exited`** — measured. That is what makes `resurrect.rs` safe: killing and
+  re-splitting could trip `auto-close` on a window holding only the sidebar.
+
+### tmux-resurrect
+
+`@resurrect-hook-post-restore-all` is the trigger, and it is not a tmux hook: resurrect
+`eval`s it in **bash**, so the value is a shell command. Three traps, all now guarded in
+the conf, all of which break the *user's* half of the hook and not just ours:
+
+- Append, never replace — the value may already be theirs.
+- Strip our chunk before appending, for the same reason our tmux hooks are removed
+  first.
+- Add the `; ` separator only when there is something to separate. `eval "; cmd"` is a
+  bash syntax error, so a leading separator kills the whole hook.
+
+The reason any of this is needed: **resurrect can never restore a pane whose command is
+the pane's own process.** All three of its save-command strategies (`ps`, `pgrep`,
+`linux_procfs`) list the *children* of `pane_pid`, so a sidebar — which has none — is
+saved with an empty full-command, and `restore.sh` filters those out before
+`@resurrect-processes` is ever consulted. `pane_current_command` *is* saved, and is what
+`resurrect.rs` matches on.
+
+Verifying it needs one extra precaution beyond the usual `-L probe`: **set
+`@resurrect-dir` to a temp dir on the probe server first**, or resurrect's scripts write
+to `~/.local/share/tmux/resurrect/` and clobber the developer's real snapshot.
 
 ## Testing conventions
 
@@ -277,7 +305,7 @@ tmux -L probe kill-server
 from theirs. Run the plugin's own commands *inside* the probe server
 (`tmux -L probe new-window "…/agent-mgr daemon --once"`), for the same `$TMUX` reason.
 
-Three recipes that have earned their keep:
+Four recipes that have earned their keep:
 
 - **Fire a hook by hand.** It reads stdin and attributes to `$TMUX_PANE`, exactly as
   it inherits both from Claude Code, so you can aim one at another pane:
@@ -290,6 +318,12 @@ Three recipes that have earned their keep:
 - **Measure the flicker claim.** `AGENT_MGR_DEBUG_FRAMES=/tmp/frames agent-mgr`
   writes the draw count on exit. An idle sidebar has measured `frames=2` over 35 s
   and 25 s. If a change makes that number grow, invariant 2 is broken.
+- **Run a whole resurrect cycle.** `set-option -g @resurrect-dir /tmp/probe-resurrect`
+  on the probe server *first*, then open sidebars, run resurrect's
+  `scripts/save.sh quiet` and later `scripts/restore.sh` inside the probe server, with
+  `kill-server` and a fresh one in between to stand in for a reboot. Set a decoy
+  `@resurrect-hook-post-restore-all` beforehand and check it still ran afterwards —
+  that is the assertion that catches clobbering the user's hook.
 - **Re-derive an agent's real screens.** Launch the agent in the probe server with
   its prompt in argv so it auto-submits, and diff-capture in a loop beside it,
   saving a file each time `capture-pane -p` *plus* `pane_title` and
@@ -329,12 +363,13 @@ because it is how both agents mark a selected menu row.
 ## State of the work
 
 All four planned phases are done: passive sidebar, popup + navigation, Claude Code
-hooks, polish (git rows, tab glyphs, options, preview colour).
+hooks, polish (git rows, tab glyphs, options, preview colour), plus the
+tmux-resurrect integration.
 
-On the `notes-panel` branch of this fork, a fifth: the global scratchpad
-(`notes.rs`), its sidebar panel (`ui/notes.rs`), and the markdown highlighter for
-its detail popup (`highlight.rs`). Upstream's out-of-scope list names "a bottom
-panel", which is why it lives here rather than in a PR. Its living doc is
+This fork adds a fifth: the global scratchpad (`notes.rs`), its sidebar panel
+(`ui/notes.rs`), and the markdown highlighter for its detail popup
+(`highlight.rs`). Upstream's out-of-scope list names "a bottom panel", which is
+why it lives here rather than going back as a PR. Its living doc is
 `~/agents/handoffs/agent-mgr-notes-panel-handoff.md` — it carries the reasoning
 behind the decisions that are not obvious from the code, including why the panel
 is a focus mode and why a note heading requires its checkbox.

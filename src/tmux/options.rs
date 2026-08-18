@@ -139,6 +139,14 @@ pub mod conf_only {
     pub const CFG_KEY_FOCUS: &str = "@agent_mgr_key_focus";
     /// Prefix-less key opening the full-screen popup; `none` binds nothing.
     pub const CFG_KEY_POPUP: &str = "@agent_mgr_key_popup";
+    /// When not `off`, append `agent-mgr restore` to tmux-resurrect's
+    /// `post-restore-all` hook, so sidebars come back with the session instead of
+    /// as the plain shells resurrect leaves behind. See [`crate::resurrect`].
+    pub const CFG_RESURRECT: &str = "@agent_mgr_resurrect";
+    /// tmux-resurrect's own hook option — *not* ours. We append to whatever value
+    /// the user already set, so it is named here to keep the whole option surface
+    /// in one place and to let a test check the conf still writes it.
+    pub const RESURRECT_HOOK: &str = "@resurrect-hook-post-restore-all";
     /// Whether this tmux can host the popup surface (`display-popup -B -E`,
     /// tmux >= 3.3). Written by `tmux-agent-mgr.tmux` at load, read by the conf to
     /// decide whether binding the popup key would produce a working key or one
@@ -235,6 +243,8 @@ mod tests {
             conf_only::CFG_KEY_ALL,
             conf_only::CFG_KEY_FOCUS,
             conf_only::CFG_KEY_POPUP,
+            conf_only::CFG_RESURRECT,
+            conf_only::RESURRECT_HOOK,
             conf_only::HAS_POPUP,
             CFG_BIN,
         ] {
@@ -329,6 +339,41 @@ mod tests {
                 "{hook} is set but not removed first — a reload would duplicate it"
             );
         }
+    }
+
+    #[test]
+    fn the_conf_appends_to_the_resurrect_hook_and_strips_its_own_chunk_first() {
+        // Three separate programs meet in this one option: our conf writes it,
+        // tmux stores it, resurrect eval's it as bash. Nothing type-checks any of
+        // that, and each half has already been reasoned about in the conf:
+        // appending without stripping respawns every sidebar twice after a config
+        // reload, and the strip is what makes turning the feature off remove it.
+        let hook = conf_only::RESURRECT_HOOK;
+        assert!(
+            SHIPPED_CONF.contains(&format!("hook={hook}")),
+            "the conf must write {hook}"
+        );
+        assert!(
+            SHIPPED_CONF.contains(r#"restore >/dev/null 2>&1""#),
+            "the conf must append the restore command to the hook"
+        );
+        assert_eq!(
+            SHIPPED_CONF.matches(r#"restore >/dev/null 2>&1||g""#).count(),
+            2,
+            "both the on and off branches must strip our previous chunk"
+        );
+    }
+
+    #[test]
+    fn the_conf_invokes_the_restore_subcommand_main_actually_dispatches() {
+        // The subcommand name reaches main.rs by way of a *third* program's option
+        // value, so a rename would only show up as sidebars that never come back
+        // after a resurrect restore.
+        let main = include_str!("../main.rs");
+        assert!(
+            main.contains(r#"Some("restore")"#),
+            "main.rs no longer dispatches the subcommand the conf calls"
+        );
     }
 
     #[test]

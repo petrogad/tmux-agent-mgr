@@ -9,9 +9,10 @@
 //! | `focus <window-id> <pane-id> [path]` | select the sidebar, or hop back out of it |
 //! | `resize <window-id>` | re-clamp the sidebar width after a window resize |
 //! | `auto-close <window-id>` | close a window left holding only a sidebar |
+//! | `restore` | re-open the sidebars a `tmux-resurrect` restore left as shells |
 //! | `daemon [--once]` | the status poller; `--once` prints one pass and exits |
 //! | `hook <agent> <event>` | receive an agent hook payload on stdin |
-//! | `note add\|list\|show` | the global scratchpad; the surface agents write to |
+//! | `note add\|list\|show\|edit` | the global scratchpad; the surface agents write to |
 //!
 //! Keeping this in one binary is what lets `hook.sh` resolve a single path and
 //! lets the TUI re-exec itself as the daemon without a second install step.
@@ -27,6 +28,7 @@ mod nav;
 mod notes;
 mod pane;
 mod preview;
+mod resurrect;
 mod search;
 mod tmux;
 mod ui;
@@ -55,6 +57,7 @@ fn main() {
         Some("focus") => pane::cmd_focus(&rest),
         Some("resize") => pane::cmd_resize(&rest),
         Some("auto-close") => pane::cmd_auto_close(&rest),
+        Some("restore") => resurrect::cmd_restore(&rest),
         Some("daemon") => daemon::cmd_daemon(&rest),
         Some("hook") => hook::cmd_hook(&rest),
         Some("note") => notes::cmd_note(&rest),
