@@ -269,11 +269,11 @@ fn recent_lines(text: &str, count: usize) -> String {
 
 /// Claude advertises activity by prefixing its OSC title with a spinner frame
 /// followed by a space. *Which* frames it cycles through is not stable across
-/// releases: braille (`⠋`) held for a long time, and 2.1.229 sets a quartered
-/// circle (`◑ `) instead. Accepting every family it has used, rather than only
-/// the one that happened to ship when this was written, is what keeps an upgrade
-/// from silently pinning every Claude pane to idle — which is exactly what the
-/// change to circles did.
+/// releases: braille (`⠋`) held for a long time, then quartered circles
+/// (`◑ ` at 2.1.229, `◐ ` at 2.1.235). Accepting every family it has used,
+/// rather than only the one that happened to ship when this was written, is
+/// what keeps an upgrade from silently pinning every Claude pane to idle —
+/// which is exactly what the change to circles did.
 ///
 /// Deliberately *not* a catch-all "any non-ASCII leader": Claude's idle title
 /// starts with `✳ `, so a blanket rule would read idle as working.
@@ -600,7 +600,7 @@ mod tests {
         assert!(!starts_with_spinner(""));
     }
 
-    /// Claude 2.1.229 swapped its title spinner from braille to `◑`. Both
+    /// Claude swapped its title spinner from braille to quartered circles. Both
     /// families have to read as working, and the idle `✳` must not.
     #[test]
     fn reads_every_claude_spinner_family_as_working() {
