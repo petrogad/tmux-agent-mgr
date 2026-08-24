@@ -30,7 +30,9 @@ mod worker;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
@@ -47,9 +49,23 @@ use crate::ui::{self, Counts, Surface, rows, rows::RenderedList, theme::Theme};
 
 /// Spinner frame duration. Ten frames, so a full cycle is 1.5 s.
 const SPINNER_INTERVAL: Duration = Duration::from_millis(150);
-/// Input poll timeout when nothing is running. Bounds how long a SIGUSR1 or a
-/// worker snapshot waits to be noticed; each wake-up is pure CPU, no terminal I/O.
-const QUIET_TIMEOUT: Duration = Duration::from_millis(250);
+/// Longest wait when nothing is running. Only a backstop: input and snapshots both
+/// arrive on the loop's channel and wake it immediately, so nothing observable is
+/// waiting on this — which is why it can be long rather than a compromise between
+/// responsiveness and idle wake-ups.
+const QUIET_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Everything the event loop reacts to, on one channel.
+///
+/// Both sources have to be waited on together, or waiting on either adds its
+/// timeout to the other's latency: with input polled on a timer and snapshots read
+/// only between polls, a tree that had already been collected sat unseen for up to
+/// the poll timeout. One channel means `recv` blocks until something has actually
+/// happened, and no sooner.
+pub enum Msg {
+    Snapshot(worker::Snapshot),
+    Input(Event),
+}
 
 /// Which panes the list shows.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -1070,44 +1086,28 @@ pub fn run(
         app.load_notes(&path.clone());
     }
 
+    let (tx, rx) = mpsc::channel();
     let worker = worker::spawn(
         tmux::global_bool(tmux::CFG_AGENTS_ONLY, false),
         app.own_pane.clone(),
+        // Read by the collector thread, not here: a focus hook's signal should start
+        // a collection at once rather than after however long this loop is waiting.
+        needs_refresh,
+        tx.clone(),
         app.notes_file.clone(),
     );
     // Nothing to show until the first collection lands; ask for it now rather
     // than waiting out an interval.
     worker.request_refresh();
+    spawn_input_reader(tx);
 
     let mut last_fingerprint: Option<u64> = None;
     let mut last_spinner = Instant::now();
     let started = Instant::now();
+    let mut batch: Vec<Msg> = Vec::new();
 
     while !app.quit {
-        // 1. Newest snapshot wins; drain so a burst can't build a backlog.
-        let mut received = false;
-        while let Ok(snapshot) = worker.rx.try_recv() {
-            app.sessions = snapshot.sessions;
-            // Keep the previous capture when this pass carried none: the target is
-            // set after the first rebuild, so the very first snapshot has no preview
-            // and clearing here would blank it once per interval.
-            if let Some(preview) = snapshot.preview {
-                app.preview = Some(preview);
-            }
-            // After the tree, so the pane it names is one this snapshot listed.
-            app.apply_focus(snapshot.focused);
-            // Absent on every pass where the file did not move, which is almost
-            // all of them; see `Snapshot::notes`.
-            app.apply_notes(snapshot.notes);
-            received = true;
-        }
-
-        // 2. A focus change reached us by signal.
-        if needs_refresh.swap(false, Ordering::Relaxed) {
-            worker.request_refresh();
-        }
-
-        // 3. Advance the spinner only when something is running. This is what
+        // 1. Advance the spinner only when something is running. This is what
         //    makes a quiet sidebar produce identical output pass after pass.
         let active = app.any_active();
         if active && last_spinner.elapsed() >= SPINNER_INTERVAL {
@@ -1115,7 +1115,7 @@ pub fn run(
             last_spinner = Instant::now();
         }
 
-        // 4. Rebuild (pure) and draw only if the output moved.
+        // 2. Rebuild (pure) and draw only if the output moved.
         app.rebuild();
         // Tell the worker what to capture next. After rebuild, because the selection
         // may have been clamped or re-anchored onto a different window.
@@ -1126,37 +1126,82 @@ pub fn run(
             app.frames += 1;
             last_fingerprint = Some(current);
         }
-        let _ = received;
 
-        // 5. Wait for input. When active, wake in time for the next spinner
-        //    frame; otherwise sleep as long as responsiveness allows.
+        // 3. Block until something happens. When active, wake in time for the next
+        //    spinner frame; otherwise wait out [`QUIET_TIMEOUT`], since a keystroke
+        //    or a snapshot will end the wait itself.
         let timeout = if active {
             SPINNER_INTERVAL.saturating_sub(last_spinner.elapsed())
         } else {
             QUIET_TIMEOUT
         };
-        if !event::poll(timeout.max(Duration::from_millis(10)))? {
-            continue;
+        match rx.recv_timeout(timeout.max(Duration::from_millis(1))) {
+            Ok(msg) => batch.push(msg),
+            Err(RecvTimeoutError::Timeout) => {}
+            // Both senders are gone, so nothing can arrive again — the terminal is
+            // closing under us and the tmux server is unreachable.
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        loop {
-            match event::read()? {
-                // The only clear in the crate: our geometry changed underneath
-                // us, so the previous frame's cells are meaningless.
-                Event::Resize(width, height) => {
+        // 4. Drain whatever else is queued before drawing, so a burst of snapshots
+        //    or a held key costs one frame rather than one each.
+        while let Ok(msg) = rx.try_recv() {
+            batch.push(msg);
+        }
+        for msg in batch.drain(..) {
+            match msg {
+                Msg::Snapshot(snapshot) => {
+                    app.sessions = snapshot.sessions;
+                    // Keep the previous capture when this pass carried none: the
+                    // target is set after the first rebuild, so the very first
+                    // snapshot has no preview and clearing here would blank it once
+                    // per interval.
+                    if let Some(preview) = snapshot.preview {
+                        app.preview = Some(preview);
+                    }
+                    // After the tree, so the pane it names is one this snapshot
+                    // listed.
+                    app.apply_focus(snapshot.focused);
+                    // Absent on every pass where the file did not move, which is
+                    // almost all of them; see `Snapshot::notes`.
+                    app.apply_notes(snapshot.notes);
+                }
+                // The only clear in the crate: our geometry changed underneath us,
+                // so the previous frame's cells are meaningless.
+                Msg::Input(Event::Resize(width, height)) => {
                     app.size = (width, height);
                     terminal.clear()?;
                     last_fingerprint = None;
                 }
-                other => input::handle(other, &mut app, &worker),
-            }
-            if !event::poll(Duration::ZERO)? {
-                break;
+                Msg::Input(event) => input::handle(event, &mut app, &worker),
             }
         }
     }
 
     report_frames(&app, started.elapsed());
     Ok(())
+}
+
+/// Forward terminal events onto the loop's channel.
+///
+/// A thread rather than a poll on the main one: `event::poll` cannot wait on our
+/// channel as well, so any timeout chosen here would be added to how long an
+/// already-collected snapshot sits unread. Blocking in `read` costs nothing while
+/// the terminal is quiet.
+///
+/// The thread ends when the loop drops the receiver — noticed on the next event,
+/// which is fine: our pane closes with the process either way.
+fn spawn_input_reader(tx: Sender<Msg>) {
+    thread::spawn(move || {
+        loop {
+            // A read error means stdin is gone, and so is any further input.
+            let Ok(event) = event::read() else {
+                return;
+            };
+            if tx.send(Msg::Input(event)).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 /// Write the draw count to the path in `AGENT_MGR_DEBUG_FRAMES`, if set.

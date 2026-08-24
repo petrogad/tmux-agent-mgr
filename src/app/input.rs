@@ -366,9 +366,7 @@ mod tests {
             })
             .collect();
         app.rebuild();
-        // No notes file: a test must not watch, read, or race the developer's own
-        // scratchpad.
-        (app, crate::app::worker::spawn(false, String::new(), None))
+        (app, Worker::inert())
     }
 
     fn press(app: &mut App, worker: &Worker, code: KeyCode) {
