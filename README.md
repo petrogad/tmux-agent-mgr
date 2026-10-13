@@ -150,6 +150,27 @@ itself.
 Window tabs also carry a rolled-up status glyph, appended to your existing
 `window-status-format` without replacing it.
 
+### The context card
+
+```
+ flugo                     FLU-88
+ ⎇ pete/flu-88-stack-ports
+ ● #142 Derive ports from the bra…
+──────────────────────────────────
+```
+
+The pane under the cursor, on the web: its folder (→ the repo), branch (→ its PR,
+else the branch), pull request (`●` open, `○` draft, `✓` merged, `✕` closed) and the
+ticket key found in the branch or PR title. Each is a terminal hyperlink. With tmux
+`mouse on`, open one with your terminal's bypass modifier — **Shift-click** in
+WezTerm, iTerm2 and kitty. The plugin adds `hyperlinks` to tmux's
+`terminal-features` for you, since tmux drops links otherwise.
+
+PRs come from [`gh`](https://cli.github.com/), so it needs to be installed and
+authenticated; without it the card still shows folder, branch and ticket. Lookups
+are cached for a minute and never block the list. The card hides itself in a pane
+under 16 rows.
+
 ### Global navigation
 
 On by default, and passed through to Vim when the focused pane is running it:
@@ -177,6 +198,9 @@ Set these **before** the plugin loads; it only fills in what you haven't.
 | `@agent_mgr_key_all` | `E` | prefix key toggling it everywhere |
 | `@agent_mgr_key_focus` | `o` | prefix key jumping into the sidebar and back; `none` binds nothing |
 | `@agent_mgr_key_popup` | `C-n` | prefix-less popup key; `none` binds nothing |
+| `@agent_mgr_card` | `on` | the context card atop the sidebar (below) |
+| `@agent_mgr_ticket_url` | *unset* | ticket link, `{key}` replaced: `https://acme.atlassian.net/browse/{key}` |
+| `@agent_mgr_ticket_prefixes` | *unset* | project keys to find in branch names, any case: `GRPS FLU`. Unset: any uppercase `ABC-123` |
 
 Colors take a `#RRGGBB` or a 0–255 palette index:
 `@agent_mgr_color_{accent,session,working,blocked,idle,done,error,branch}`.

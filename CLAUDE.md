@@ -87,6 +87,8 @@ daemon.rs      one poller per tmux server: precedence, directional debounce, run
 hook/mod.rs    `hook <agent> <event>`: stdin JSON, pane state read, apply writes.
 hook/claude.rs the Claude Code mapping. Pure: plan(event, payload, state, now).
 git.rs         branch + worktree for a path, TTL-cached including negative results.
+forge.rs       the web side of a checkout: remote -> page URL, `gh pr view`, and
+               ticket keys matched out of branch/PR title. Fork-only; see below.
 resurrect.rs   `restore`: read tmux-resurrect's own snapshot, respawn the binary
                into the panes that were sidebars. Snapshot parsing is pure.
 pane.rs        sidebar pane lifecycle: resolve_width's clamp order, which side the
@@ -374,11 +376,27 @@ because it is how both agents mark a selected menu row.
 
 All four planned phases are done: passive sidebar, popup + navigation, Claude Code
 hooks, polish (git rows, tab glyphs, options, preview colour), plus the
-tmux-resurrect integration. Living docs for the
-work sit outside the repo, in `~/agents/handoffs/tmux-agent-mgr-phase1-handoff.md`
-and `~/agents/plans/tmux-agent-mgr-plan.md` — check them before starting, they carry
-the current status and the reasoning behind decisions that are not obvious from the
-code.
+tmux-resurrect integration. The docs this section used to point at,
+`~/agents/handoffs/tmux-agent-mgr-phase1-handoff.md` and
+`~/agents/plans/tmux-agent-mgr-plan.md`, no longer exist. Do not go looking for them.
+
+This fork adds the **context card** (`forge.rs`, `ui/card.rs`): folder, branch, PR
+and ticket for the selected pane, as OSC 8 hyperlinks, atop the sidebar. It is the
+"PR fetching" the out-of-scope list above rules out upstream, which is why it lives
+here. Three things about it are load-bearing:
+
+- **`gh` never runs on the collector.** It has its own thread in `app/worker.rs`,
+  asks only about the selected pane, and caches every answer — "no PR" included —
+  for a minute. A slow network delays the card's PR row, never the list.
+- **The card is fixed-height** whatever it knows, or moving the cursor onto a pane
+  with a PR would shift the list under it. Hence the "looking" / "no pull request"
+  placeholders rather than an absent row.
+- **Links ride inside cell symbols** (`ui::link_cells`) with
+  `CellDiffOption::ForcedWidth`, so ratatui diffs them as ordinary cells. They are
+  invisible in the plain text, which is why the fingerprint hashes `card.links`
+  separately. Verified end to end on a probe server: `capture-pane -pe` shows the
+  `ESC ]8;;url` sequences stored per cell, and an idle sidebar still draws once the
+  PR row settles and then never again.
 
 Known gaps: the `▸ bg` row has no writer (deliberate, above), and the flicker check's
 companion case — that a *working* agent advances the spinner and nothing more — has

@@ -13,7 +13,6 @@ use crossterm::event::{
 use super::{App, worker::Worker};
 use crate::nav::{self, Direction};
 use crate::tmux;
-use crate::ui;
 
 pub fn handle(event: Event, app: &mut App, worker: &Worker) {
     match event {
@@ -200,10 +199,13 @@ fn page(app: &App) -> isize {
 /// a click is testable without issuing the `switch-client` that would move the tmux
 /// client running the test suite.
 fn click(app: &mut App, row: u16, button: MouseButton) -> bool {
-    if row < ui::HEADER_HEIGHT {
+    // The title and the card: the card's links are the terminal's to open
+    // (Shift-click under tmux mouse mode), not a pane to select.
+    let header = app.header_height();
+    if row < header {
         return false;
     }
-    let line = (row - ui::HEADER_HEIGHT) as usize + app.scroll;
+    let line = (row - header) as usize + app.scroll;
     let Some(block) = app.list.block_at_line(line) else {
         return false;
     };
@@ -220,6 +222,7 @@ fn click(app: &mut App, row: u16, button: MouseButton) -> bool {
 mod tests {
     use super::*;
     use crate::app::StatusFilter;
+    use crate::ui;
     use crate::model::{
         AgentKind, AgentState, AgentStatus, PaneInfo, SessionGroup, StatusSource, WindowInfo,
     };

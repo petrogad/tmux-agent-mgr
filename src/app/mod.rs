@@ -27,6 +27,7 @@
 mod input;
 mod worker;
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -39,12 +40,14 @@ use crossterm::event::{self, Event};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::daemon;
-use crate::model::{AgentState, AgentStatus, SessionGroup};
+use crate::forge::{RepoContext, TicketConfig};
+use crate::model::{AgentState, AgentStatus, PaneInfo, SessionGroup};
 use crate::nav::{self, Direction};
 use crate::preview::PanePreview;
 use crate::search::Query;
 use crate::tmux;
-use crate::ui::{self, Counts, Surface, rows, rows::RenderedList, theme::Theme};
+use crate::ui::{self, Counts, Surface, card, rows, rows::RenderedList, theme::Theme};
+use worker::ContextKey;
 
 /// Spinner frame duration. Ten frames, so a full cycle is 1.5 s.
 const SPINNER_INTERVAL: Duration = Duration::from_millis(150);
@@ -64,6 +67,8 @@ const QUIET_TIMEOUT: Duration = Duration::from_secs(1);
 pub enum Msg {
     Snapshot(worker::Snapshot),
     Input(Event),
+    /// The context thread's answer for one `(path, branch)`.
+    Context(ContextKey, RepoContext),
 }
 
 /// Which panes the list shows.
@@ -188,6 +193,16 @@ pub struct App {
     pub quit: bool,
     /// Draws performed, for the flicker regression check.
     pub frames: u64,
+    /// Whether the context card is wanted at all (`@agent_mgr_card`). Off until
+    /// [`run`] reads the option, so tests never see a card they did not ask for.
+    pub show_card: bool,
+    pub tickets: TicketConfig,
+    /// Every context answer this sidebar has had, by `(path, branch)`. Kept rather
+    /// than only the current one so moving back onto a pane shows what we already
+    /// know at once, instead of flashing "looking" while the thread re-confirms it.
+    pub contexts: HashMap<ContextKey, RepoContext>,
+    /// The card as of the last rebuild. Derived, like [`Self::list`].
+    pub card: card::Card,
 }
 
 impl App {
@@ -219,6 +234,10 @@ impl App {
             size,
             quit: false,
             frames: 0,
+            show_card: false,
+            tickets: TicketConfig::default(),
+            contexts: HashMap::new(),
+            card: card::Card::default(),
         }
     }
 
@@ -243,7 +262,70 @@ impl App {
     }
 
     pub fn list_height(&self) -> usize {
-        ui::list_height(self.size.1) as usize
+        ui::list_height(self.size.1, self.header_height()) as usize
+    }
+
+    /// Rows above the list: the title, plus the card when it is showing.
+    pub fn header_height(&self) -> u16 {
+        ui::HEADER_HEIGHT + if self.card_visible() { card::HEIGHT } else { 0 }
+    }
+
+    /// The card is a sidebar thing: the popup has a preview doing the same job
+    /// better, and a short pane needs every row for the list.
+    pub fn card_visible(&self) -> bool {
+        self.show_card
+            && self.surface == Surface::Sidebar
+            && self.size.1 >= card::MIN_PANE_HEIGHT
+    }
+
+    /// The pane the cursor is on, as the tree has it.
+    fn selected_pane_info(&self) -> Option<&PaneInfo> {
+        let pane_id = self.selected_pane()?;
+        self.sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .find(|pane| pane.pane_id == pane_id)
+    }
+
+    /// What the context thread should look up: the selected pane's checkout, when
+    /// the card is up and the pane is on a branch at all.
+    pub fn context_target(&self) -> Option<ContextKey> {
+        if !self.card_visible() {
+            return None;
+        }
+        let pane = self.selected_pane_info()?;
+        (!pane.branch.is_empty()).then(|| (pane.current_path.clone(), pane.branch.clone()))
+    }
+
+    /// Take in a context answer. Bounded crudely: a sidebar visits a few dozen
+    /// checkouts, and starting over past that costs one "looking" per pane.
+    pub fn apply_context(&mut self, key: ContextKey, context: RepoContext) {
+        if self.contexts.len() >= 64 && !self.contexts.contains_key(&key) {
+            self.contexts.clear();
+        }
+        self.contexts.insert(key, context);
+    }
+
+    fn rebuild_card(&mut self) {
+        if !self.card_visible() {
+            self.card = card::Card::default();
+            return;
+        }
+        let pane = self.selected_pane_info();
+        let none = RepoContext::default();
+        let lookup = match pane {
+            Some(pane) if pane.branch.is_empty() => card::Lookup::Done(&none),
+            Some(pane) => match self
+                .contexts
+                .get(&(pane.current_path.clone(), pane.branch.clone()))
+            {
+                Some(context) => card::Lookup::Done(context),
+                None => card::Lookup::Pending,
+            },
+            None => card::Lookup::Pending,
+        };
+        self.card = card::build(pane, lookup, &self.tickets, self.size.0 as usize, &self.theme);
     }
 
     /// The active search query, or an empty one when no search is open.
@@ -298,6 +380,7 @@ impl App {
         self.clamp_scroll();
         self.counts = Counts::tally(&self.sessions);
         self.compose_preview();
+        self.rebuild_card();
     }
 
     /// Take in where tmux focus now is, moving the cursor if it moved.
@@ -610,6 +693,10 @@ fn fingerprint(app: &App) -> u64 {
     // Pane content changing behind the preview is a real reason to redraw, and
     // hashing the composed lines is how the loop learns about it.
     app.preview_lines.hash(&mut hasher);
+    // Links are invisible in the text, so a PR URL changing under the same title
+    // has to be hashed in its own right.
+    app.card.plain.hash(&mut hasher);
+    app.card.links.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -621,6 +708,11 @@ pub fn run(
 ) -> io::Result<()> {
     let size = terminal.size()?;
     let mut app = App::new(surface, tmux_pane, (size.width, size.height));
+    app.show_card = tmux::global_bool(tmux::CFG_CARD, true);
+    app.tickets = TicketConfig::new(
+        tmux::global(tmux::CFG_TICKET_PREFIXES).as_deref(),
+        tmux::global(tmux::CFG_TICKET_URL).as_deref(),
+    );
 
     let (tx, rx) = mpsc::channel();
     let worker = worker::spawn(
@@ -655,6 +747,7 @@ pub fn run(
         // Tell the worker what to capture next. After rebuild, because the selection
         // may have been clamped or re-anchored onto a different window.
         worker.set_preview_target(app.preview_window());
+        worker.set_context_target(app.context_target());
         let current = fingerprint(&app);
         if last_fingerprint != Some(current) {
             terminal.draw(|frame| ui::draw(frame, &app))?;
@@ -705,6 +798,7 @@ pub fn run(
                     last_fingerprint = None;
                 }
                 Msg::Input(event) => input::handle(event, &mut app, &worker),
+                Msg::Context(key, context) => app.apply_context(key, context),
             }
         }
     }

@@ -1,11 +1,15 @@
 //! Drawing the sidebar: a header, the scrollable list, and a footer.
 
+pub mod card;
 pub mod help;
 pub mod rows;
 pub mod text;
 pub mod theme;
 
+use std::num::NonZeroU16;
+
 use ratatui::Frame;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -75,7 +79,7 @@ pub fn split_width(surface: Surface, total_width: u16) -> (u16, Option<u16>) {
 pub fn preview_area(surface: Surface, size: (u16, u16)) -> Option<crate::preview::Rect> {
     let (_, preview_width) = split_width(surface, size.0);
     let width = preview_width? as usize;
-    let height = list_height(size.1) as usize;
+    let height = list_height(size.1, HEADER_HEIGHT) as usize;
     (width > 0 && height > 0).then_some(crate::preview::Rect {
         x: 0,
         y: 0,
@@ -85,13 +89,16 @@ pub fn preview_area(surface: Surface, size: (u16, u16)) -> Option<crate::preview
 }
 
 /// Lines reserved at the top and bottom of the pane. Both are fixed so the list
-/// viewport height is stable and scrolling doesn't jump when a count changes.
+/// viewport height is stable and scrolling doesn't jump when a count changes. The
+/// context card, when shown, sits under the title and is fixed-height for the
+/// same reason; see [`crate::app::App::header_height`].
 pub const HEADER_HEIGHT: u16 = 1;
 pub const FOOTER_HEIGHT: u16 = 1;
 
-/// Visible list height for a pane of `total_height` rows.
-pub fn list_height(total_height: u16) -> u16 {
-    total_height.saturating_sub(HEADER_HEIGHT + FOOTER_HEIGHT)
+/// Visible list height for a pane of `total_height` rows under `header` rows of
+/// title and card.
+pub fn list_height(total_height: u16, header: u16) -> u16 {
+    total_height.saturating_sub(header + FOOTER_HEIGHT)
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -103,15 +110,26 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let header = Rect { height: HEADER_HEIGHT.min(area.height), ..area };
     frame.render_widget(Paragraph::new(header_line(app, area.width as usize)), header);
 
+    let header_height = app.header_height();
+    if header_height > HEADER_HEIGHT && area.height > header_height {
+        let card_area = Rect {
+            y: area.y + HEADER_HEIGHT,
+            height: card::HEIGHT,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(app.card.lines.clone()), card_area);
+        link_cells(frame.buffer_mut(), card_area, &app.card.links);
+    }
+
     let (list_width, preview_width) = split_width(app.surface, area.width);
-    let list_rows = list_height(area.height);
+    let list_rows = list_height(area.height, header_height);
 
     if let Some(preview_width) = preview_width
         && list_rows > 0
     {
         let pane = Rect {
             x: area.x + list_width,
-            y: area.y + HEADER_HEIGHT,
+            y: area.y + header_height,
             width: preview_width,
             height: list_rows,
         };
@@ -120,7 +138,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     if list_rows > 0 {
         let list = Rect {
-            y: area.y + HEADER_HEIGHT,
+            y: area.y + header_height,
             width: list_width,
             height: list_rows,
             ..area
@@ -150,6 +168,43 @@ pub fn draw(frame: &mut Frame, app: &App) {
             ..area
         };
         frame.render_widget(Paragraph::new(footer_line(app, area.width as usize)), footer);
+    }
+}
+
+/// Turn the cells under each link into OSC 8 hyperlinks.
+///
+/// The escape rides inside each cell's symbol, wrapped around that one grapheme,
+/// so ratatui's diff and styling work exactly as for any other cell. What makes
+/// that safe is `ForcedWidth`: without it the diff would measure the escape bytes
+/// as printable and skip cells it believes the symbol covered. Per-cell rather
+/// than one span because a cell is the unit ratatui redraws — a link split over
+/// several writes is still one link to the terminal, since every piece carries the
+/// same URL.
+fn link_cells(buffer: &mut Buffer, area: Rect, links: &[card::Link]) {
+    for link in links {
+        // A URL is ours to print raw, so it must not be able to end the sequence
+        // early and smuggle the rest out as terminal input.
+        if link.url.chars().any(|c| c.is_control()) {
+            continue;
+        }
+        let y = area.y + link.row;
+        if y >= area.bottom() {
+            continue;
+        }
+        let end = (area.x + link.col + link.width).min(area.right());
+        let mut x = area.x + link.col;
+        while x < end {
+            let cell = &mut buffer[(x, y)];
+            let symbol = cell.symbol().to_owned();
+            let cells = width(&symbol).max(1) as u16;
+            if !symbol.is_empty() {
+                cell.set_symbol(&format!("\x1b]8;;{}\x1b\\{symbol}\x1b]8;;\x1b\\", link.url));
+                if let Some(forced) = NonZeroU16::new(cells) {
+                    cell.set_diff_option(CellDiffOption::ForcedWidth(forced));
+                }
+            }
+            x += cells;
+        }
     }
 }
 
@@ -283,7 +338,7 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
 /// previous one instead of leaving its bottom rows on screen — the one place a
 /// stale row would otherwise survive, since we never clear.
 fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let height = list_height(app.size.1) as usize;
+    let height = app.list_height();
     (0..height)
         .map(|row| match app.preview_lines.get(row) {
             Some(line) => Line::from(
@@ -492,15 +547,16 @@ mod tests {
         assert!(preview_area(Surface::Popup, (200, 2)).is_none(), "no rows");
         let area = preview_area(Surface::Popup, (200, 50)).unwrap();
         assert_eq!(area.width, (200 - LIST_WIDTH) as usize);
-        assert_eq!(area.height, list_height(50) as usize);
+        assert_eq!(area.height, list_height(50, HEADER_HEIGHT) as usize);
     }
 
     #[test]
     fn list_height_reserves_the_header_and_footer_without_underflowing() {
-        assert_eq!(list_height(40), 38);
-        assert_eq!(list_height(2), 0);
-        assert_eq!(list_height(1), 0);
-        assert_eq!(list_height(0), 0);
+        assert_eq!(list_height(40, HEADER_HEIGHT), 38);
+        assert_eq!(list_height(2, HEADER_HEIGHT), 0);
+        assert_eq!(list_height(1, HEADER_HEIGHT), 0);
+        assert_eq!(list_height(0, HEADER_HEIGHT), 0);
+        assert_eq!(list_height(40, HEADER_HEIGHT + card::HEIGHT), 34);
     }
 
     // ─── preview styling ──────────────────────────────────────────────
