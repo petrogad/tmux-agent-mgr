@@ -2,14 +2,14 @@
 //!
 //! ```text
 //! ──────────────────────────────
-//!  petrogad/flugo
-//!  ▸ flugo-ports/apps · ⎇ ports
+//!  petrogad/flugo · ⎇ ports
+//!  ▸ ~/github/flugo-ports/apps
 //!  ● #142 Derive ports fr…  FLU-88
 //! ```
 //!
 //! Pinned above the footer, and it follows **tmux focus**, not the cursor: it
 //! changes when you actually switch panes, never while you `j`/`k` through the
-//! list. Repo, then where in it you are, then the work: the PR and the ticket it
+//! list. Repo and branch, then the working directory in full, then the work: the PR and the ticket it
 //! is for — a Jira-style key from the branch or PR title, else the GitHub issue
 //! the PR says it closes. Each is a link where there is somewhere to go. The card is always [`HEIGHT`] rows whatever it has to say, so
 //! the list above it never changes height.
@@ -99,38 +99,49 @@ pub fn build(
     };
     let pr = context.and_then(|c| c.pr.as_ref());
 
-    // Row 1: the repo, as the remote names it. `owner/` muted so the name reads
-    // first; the directory's name until the remote is known.
+    // Row 1: the repo as the remote names it, and the branch. `owner/` is muted
+    // so the name reads first, and is the first thing given up for room.
     let repo_url = context.and_then(|c| c.web.clone());
-    let repo_row = match context.and_then(|c| c.web.as_deref()) {
+    let branch = (!pane.branch.is_empty()).then(|| {
+        let url = context.and_then(|c| c.branch_url(&pane.branch));
+        vec![
+            Segment::new(" · ", muted),
+            Segment::new(format!("⎇ {}", pane.branch), link_style(theme.branch, url.is_some()))
+                .link(url),
+        ]
+    });
+    let bold = |color| link_style(color, true).add_modifier(Modifier::BOLD);
+    let mut repo_row = match context.and_then(|c| c.web.as_deref()) {
         Some(web) => {
             let mut parts = web.rsplit('/');
             let name = parts.next().unwrap_or_default().to_owned();
-            let owner = parts.next().unwrap_or_default();
-            vec![
-                Segment::new(format!("{owner}/"), muted).link(repo_url.clone()),
-                Segment::new(name, link_style(theme.text, true).add_modifier(Modifier::BOLD))
-                    .link(repo_url),
-            ]
+            let owner = format!("{}/", parts.next().unwrap_or_default());
+            let wanted = width(&owner) + width(&name) + 1 + branch.as_ref().map_or(0, |b| {
+                b.iter().map(|s| width(&s.text)).sum::<usize>().min(16)
+            });
+            let mut row = Vec::new();
+            if wanted <= total_width {
+                row.push(Segment::new(owner, muted).link(repo_url.clone()));
+            }
+            row.push(Segment::new(name, bold(theme.text)).link(repo_url));
+            row
         }
         None => vec![Segment::new(
             folder_name(&pane.current_path),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )],
     };
+    repo_row.extend(branch.into_iter().flatten());
     push(&mut card, total_width, repo_row, Vec::new());
 
-    // Row 2: where in the checkout you are, and on which branch.
-    let mut place = vec![{
-        let url = context.and_then(|c| c.folder_url(&pane.branch, &pane.current_path));
-        let label = folder_label(context.and_then(|c| c.toplevel.as_deref()), &pane.current_path);
-        Segment::new(format!("▸ {label}"), link_style(theme.window, url.is_some())).link(url)
-    }];
-    if !pane.branch.is_empty() {
-        let url = context.and_then(|c| c.branch_url(&pane.branch));
-        place.push(Segment::new(" · ", muted));
-        place.push(Segment::new(format!("⎇ {}", pane.branch), link_style(theme.branch, url.is_some())).link(url));
-    }
+    // Row 2: the working directory, whole — trimmed from the left, since the
+    // end of a path is the part that says where you are.
+    let folder_url = context.and_then(|c| c.folder_url(&pane.branch, &pane.current_path));
+    let path = truncate_left(&home_relative(&pane.current_path), total_width.saturating_sub(4));
+    let place = vec![
+        Segment::new("▸ ", Style::default().fg(theme.folder)),
+        Segment::new(path, link_style(theme.folder, folder_url.is_some())).link(folder_url),
+    ];
     push(&mut card, total_width, place, Vec::new());
 
     // Row 3: the pull request, or why there is none, with the ticket pinned right.
@@ -171,18 +182,38 @@ pub fn build(
     card
 }
 
-/// Where in the checkout `path` is: the checkout's directory, then the path
-/// below it. The directory leads because it is what tells two worktrees of the
-/// same repo apart. Just the directory's own name until the root is known.
-fn folder_label(toplevel: Option<&str>, path: &str) -> String {
-    let Some(root) = toplevel else {
-        return folder_name(path);
-    };
-    match crate::forge::relative(root, path) {
-        Some(rel) if rel.is_empty() => folder_name(root),
-        Some(rel) => format!("{}/{rel}", folder_name(root)),
-        None => folder_name(path),
+/// `path` with the home directory written as `~`.
+fn home_relative(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home.trim_end_matches('/');
+    match path.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
+        }
+        _ => path.to_owned(),
     }
+}
+
+/// Keep the *end* of `value` within `budget` cells, marking the cut with `…`.
+fn truncate_left(value: &str, budget: usize) -> String {
+    if width(value) <= budget {
+        return value.to_owned();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 1; // the ellipsis
+    for ch in value.chars().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        kept.push(ch);
+        used += w;
+    }
+    kept.push('…');
+    kept.into_iter().rev().collect()
 }
 
 /// The link under a card-local cell, if any.
@@ -273,7 +304,7 @@ fn push(card: &mut Card, total_width: usize, left: Vec<Segment>, right: Vec<Segm
 fn push_rule(card: &mut Card, total_width: usize, theme: &Theme) {
     let rule = "─".repeat(total_width);
     card.plain.push(rule.clone());
-    card.lines.push(Line::from(Span::styled(rule, Style::default().fg(theme.unknown))));
+    card.lines.push(Line::from(Span::styled(rule, Style::default().fg(theme.rule))));
 }
 
 #[cfg(test)]
@@ -368,8 +399,8 @@ mod tests {
     fn rows_read_repo_then_place_then_work() {
         let card = card_for("/w/flugo-ports/apps", "pete/flu-88-ports", &with_pr("Derive ports"), &tickets());
         assert!(card.plain[0].starts_with('─'));
-        assert_eq!(card.plain[1].trim_end(), " o/flugo");
-        assert!(card.plain[2].starts_with(" ▸ flugo-ports/apps · ⎇ pete/flu-88-ports"));
+        assert_eq!(card.plain[1].trim_end(), " o/flugo · ⎇ pete/flu-88-ports");
+        assert_eq!(card.plain[2].trim_end(), " ▸ /w/flugo-ports/apps");
         assert!(card.plain[3].starts_with(" ● #142 Derive ports"));
         assert!(card.plain[3].trim_end().ends_with("FLU-88"));
     }
@@ -379,11 +410,11 @@ mod tests {
         let card = card_for("/w/flugo-ports/apps", "pete/flu-88-ports", &with_pr("Derive ports"), &tickets());
         assert_eq!(url_at(&card, 1, "flugo"), Some("https://github.com/o/flugo"));
         assert_eq!(
-            url_at(&card, 2, "▸"),
+            url_at(&card, 2, "/w"),
             Some("https://github.com/o/flugo/tree/pete/flu-88-ports/apps")
         );
         // The branch goes to the PR, not the tree, once a PR exists.
-        assert_eq!(url_at(&card, 2, "⎇"), Some("https://github.com/o/flugo/pull/142"));
+        assert_eq!(url_at(&card, 1, "⎇"), Some("https://github.com/o/flugo/pull/142"));
         assert_eq!(url_at(&card, 3, "#142"), Some("https://github.com/o/flugo/pull/142"));
         assert_eq!(url_at(&card, 3, "FLU-88"), Some("https://t/FLU-88"));
         assert_eq!(link_at(&card, 0, 1), None, "the margin is not a link");
@@ -434,9 +465,34 @@ mod tests {
     #[test]
     fn before_the_lookup_lands_the_card_falls_back_to_the_directory() {
         let card = build(Some(&pane("/w/flugo-ports/apps", "b")), Lookup::Pending, &tickets(), 30, &Theme::default());
-        assert_eq!(card.plain[1].trim_end(), " apps");
-        assert!(card.plain[2].starts_with(" ▸ apps · ⎇ b"));
+        assert_eq!(card.plain[1].trim_end(), " apps · ⎇ b");
+        assert_eq!(card.plain[2].trim_end(), " ▸ /w/flugo-ports/apps");
         assert_eq!(card.plain[3].trim(), "…");
+    }
+
+    #[test]
+    fn a_long_path_keeps_its_end() {
+        // The tail is where you are; the head is which disk it is on.
+        assert_eq!(truncate_left("/a/very/long/path/apps/android", 13), "…apps/android");
+        assert_eq!(truncate_left("/short", 12), "/short");
+        // A wide glyph that would overrun is dropped whole, never split.
+        assert_eq!(truncate_left("/a/漢字/x", 4), "…/x");
+    }
+
+    #[test]
+    fn home_is_written_as_a_tilde() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(home_relative(&format!("{home}/github/x")), "~/github/x");
+        assert_eq!(home_relative(&home), "~");
+        assert_eq!(home_relative(&format!("{home}-other/x")), format!("{home}-other/x"));
+    }
+
+    #[test]
+    fn a_narrow_card_gives_up_the_owner_before_the_name() {
+        let mut ctx = with_pr("t");
+        ctx.web = Some("https://github.com/a-rather-long-org/flugo".into());
+        let card = build(Some(&pane("/w/flugo-ports", "ports")), Lookup::Done(&ctx), &tickets(), 24, &Theme::default());
+        assert!(card.plain[1].starts_with(" flugo"), "{:?}", card.plain[1]);
     }
 
     #[test]

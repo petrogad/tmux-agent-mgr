@@ -154,8 +154,8 @@ Window tabs also carry a rolled-up status glyph, appended to your existing
 
 ```
 ──────────────────────────────────
- petrogad/flugo
- ▸ flugo-ports/apps · ⎇ pete/ports
+ petrogad/flugo · ⎇ pete/ports
+ ▸ ~/github/flugo-ports/apps
  ● #142 Derive ports from…  FLU-88
  all
 ```
@@ -164,10 +164,10 @@ Pinned above the footer: the pane **tmux focus** is on. It follows focus rather
 than the cursor, so it changes when you switch panes and stays put while you move
 through the list. Three rows, broad to specific:
 
-- **repo** — as the remote names it (→ the repo)
-- **place** — the checkout directory and the path below it, which is what tells
-  two worktrees apart (→ that folder on the branch), then the branch (→ its PR,
-  else the branch)
+- **repo** — as the remote names it (→ the repo), and the branch (→ its PR, else
+  the branch)
+- **place** — the working directory in full, trimmed from the left when long
+  (→ that folder on the branch)
 - **work** — the pull request (`●` open, `○` draft, `✓` merged, `✕` closed), and
   pinned right, the ticket: a Jira-style key from the branch or PR title (→
   `@agent_mgr_ticket_url`), else the GitHub issue the PR description closes
@@ -210,9 +210,14 @@ Set these **before** the plugin loads; it only fills in what you haven't.
 | `@agent_mgr_key_all` | `E` | prefix key toggling it everywhere |
 | `@agent_mgr_key_focus` | `o` | prefix key jumping into the sidebar and back; `none` binds nothing |
 | `@agent_mgr_key_popup` | `C-n` | prefix-less popup key; `none` binds nothing |
+| `@agent_mgr_theme` | *unset* | `mocha` for Catppuccin Mocha; unset follows the terminal palette |
 | `@agent_mgr_card` | `on` | the context card atop the sidebar (below) |
 | `@agent_mgr_ticket_url` | *unset* | ticket link, `{key}` replaced: `https://acme.atlassian.net/browse/{key}` |
 | `@agent_mgr_ticket_prefixes` | *unset* | project keys to find in branch names, any case: `GRPS FLU`. Unset: any uppercase `ABC-123` |
+
+`set -g @agent_mgr_theme mocha` swaps the default palette — indexed colours that
+follow your terminal's own — for [Catppuccin Mocha](https://catppuccin.com/palette)
+in truecolor. Dark backgrounds only, hence opt-in.
 
 Colors take a `#RRGGBB` or a 0–255 palette index:
 `@agent_mgr_color_{accent,session,working,blocked,idle,done,error,branch}`.
