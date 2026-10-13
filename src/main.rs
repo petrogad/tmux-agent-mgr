@@ -19,6 +19,7 @@
 mod app;
 mod daemon;
 mod detect;
+mod forge;
 mod git;
 mod hook;
 mod model;

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::forge::ContextCache;
 use crate::git::GitCache;
 use crate::model::SessionGroup;
 use crate::preview::{self, PanePreview};
@@ -29,6 +30,13 @@ const WAKE_SLICE: Duration = Duration::from_millis(10);
 /// How long a cached session order is reused when the session set is unchanged.
 /// Bounds how long a re-ranked session takes to move in the list.
 const ORDER_TTL: Duration = Duration::from_secs(5);
+/// How often the context thread re-asks about a pane the cursor is parked on.
+/// The cache decides whether that costs a `gh` call; this only bounds how stale a
+/// cached answer can be shown for after it expires.
+const CONTEXT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The `(path, branch)` the context card is asking about.
+pub type ContextKey = (String, String);
 
 /// One collection: the tree, plus the preview for whichever window the UI asked
 /// about. Sent together so the list and the preview on screen always describe the
@@ -53,6 +61,10 @@ pub struct Worker {
     /// Window to capture a preview of, or `None` for no preview at all — which is
     /// how the sidebar surface avoids paying for one.
     preview_target: Arc<Mutex<Option<String>>>,
+    /// What the context card wants looked up, or `None` when it shows nothing.
+    context_target: Arc<Mutex<Option<ContextKey>>>,
+    /// Raised when [`Self::context_target`] changes, so the lookup starts now.
+    context_wake: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -69,6 +81,20 @@ impl Worker {
         Self {
             wake: Arc::new(AtomicBool::new(false)),
             preview_target: Arc::new(Mutex::new(None)),
+            context_target: Arc::new(Mutex::new(None)),
+            context_wake: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Point the context lookup at a `(path, branch)`, or stop it with `None`.
+    pub fn set_context_target(&self, key: Option<ContextKey>) {
+        let Ok(mut target) = self.context_target.lock() else {
+            return;
+        };
+        if *target != key {
+            *target = key;
+            drop(target);
+            self.context_wake.store(true, Ordering::Relaxed);
         }
     }
 
@@ -110,6 +136,7 @@ pub fn spawn(
     let preview_target = Arc::new(Mutex::new(None));
     let thread_target = Arc::clone(&preview_target);
 
+    let tx_context = tx.clone();
     thread::spawn(move || {
         let mut git = GitCache::new();
         let mut order = OrderCache::default();
@@ -147,10 +174,46 @@ pub fn spawn(
         }
     });
 
+    let context_target = Arc::new(Mutex::new(None));
+    let context_wake = Arc::new(AtomicBool::new(false));
+    spawn_context(Arc::clone(&context_target), Arc::clone(&context_wake), tx_context);
+
     Worker {
         wake,
         preview_target,
+        context_target,
+        context_wake,
     }
+}
+
+/// The context card's lookups, on a thread of their own.
+///
+/// Not on the collector: `gh` is a network call, and a second spent on it there is
+/// a second the list and the focus-follow sit stale. Here it only delays the card,
+/// which shows "looking" meanwhile. One target at a time — whatever the cursor is
+/// on — so moving through ten panes costs at most the lookups you stopped on, and
+/// a cached pane answers immediately.
+fn spawn_context(
+    target: Arc<Mutex<Option<ContextKey>>>,
+    wake: Arc<AtomicBool>,
+    tx: Sender<Msg>,
+) {
+    thread::spawn(move || {
+        let mut cache = ContextCache::default();
+        loop {
+            let key = match target.lock() {
+                Ok(target) => target.clone(),
+                Err(_) => return,
+            };
+            if let Some((path, branch)) = key {
+                let context = cache.get(&path, &branch);
+                if tx.send(Msg::Context((path, branch), context)).is_err() {
+                    return;
+                }
+            }
+            wait(&[&wake], CONTEXT_INTERVAL);
+        }
+    });
 }
 
 /// Sleep up to `total`, returning early once any of `flags` has been raised.

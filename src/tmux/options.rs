@@ -110,6 +110,14 @@ pub const CFG_MAX_WIDTH: &str = "@agent_mgr_max_width";
 pub const CFG_POSITION: &str = "@agent_mgr_position";
 /// When `on`, list only panes running an agent instead of every pane.
 pub const CFG_AGENTS_ONLY: &str = "@agent_mgr_agents_only";
+/// When not `off`, show the context card — folder, branch, PR, ticket — at the
+/// top of the sidebar.
+pub const CFG_CARD: &str = "@agent_mgr_card";
+/// Ticket URL template, with `{key}` where the key goes. Unset shows keys unlinked.
+pub const CFG_TICKET_URL: &str = "@agent_mgr_ticket_url";
+/// Project keys to recognise case-insensitively, e.g. `GRPS FLU`. Unset accepts
+/// any uppercase `ABC-123`.
+pub const CFG_TICKET_PREFIXES: &str = "@agent_mgr_ticket_prefixes";
 // These two are consumed only by `agent-mgr.conf` — the tab glyph is appended to
 // `window-status-format` and the nav keys are bound, both in tmux config rather
 // than in Rust. They are declared here so the option surface lives in one place,
@@ -232,6 +240,9 @@ mod tests {
             CFG_MAX_WIDTH,
             CFG_POSITION,
             CFG_AGENTS_ONLY,
+            CFG_CARD,
+            CFG_TICKET_URL,
+            CFG_TICKET_PREFIXES,
             conf_only::CFG_TAB_STATUS,
             conf_only::CFG_NAV,
             conf_only::CFG_KEY,
