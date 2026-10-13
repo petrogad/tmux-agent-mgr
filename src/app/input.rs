@@ -13,13 +13,18 @@ use crossterm::event::{
 use super::{App, worker::Worker};
 use crate::nav::{self, Direction};
 use crate::tmux;
+use crate::ui;
 
 pub fn handle(event: Event, app: &mut App, worker: &Worker) {
     match event {
         Event::Key(key) => handle_key(key, app, worker),
         Event::Mouse(mouse) => match mouse.kind {
             MouseEventKind::Down(button) => {
-                if click(app, mouse.row, button) {
+                if let Some(url) = card_link(app, mouse.column, mouse.row) {
+                    if button == MouseButton::Left {
+                        open_url(&url);
+                    }
+                } else if click(app, mouse.row, button) {
                     app.activate_selection();
                 }
             }
@@ -199,13 +204,15 @@ fn page(app: &App) -> isize {
 /// a click is testable without issuing the `switch-client` that would move the tmux
 /// client running the test suite.
 fn click(app: &mut App, row: u16, button: MouseButton) -> bool {
-    // The title and the card: the card's links are the terminal's to open
-    // (Shift-click under tmux mouse mode), not a pane to select.
-    let header = app.header_height();
-    if row < header {
+    if row < ui::HEADER_HEIGHT {
         return false;
     }
-    let line = (row - header) as usize + app.scroll;
+    // The card and the footer own no pane, though a scrolled list's lines sit
+    // behind them.
+    if row >= ui::HEADER_HEIGHT + app.list_height() as u16 {
+        return false;
+    }
+    let line = (row - ui::HEADER_HEIGHT) as usize + app.scroll;
     let Some(block) = app.list.block_at_line(line) else {
         return false;
     };
@@ -218,11 +225,36 @@ fn click(app: &mut App, row: u16, button: MouseButton) -> bool {
     button == MouseButton::Left
 }
 
+/// The card link under a click, in pane coordinates.
+///
+/// The sidebar has the mouse (tmux `mouse on` hands clicks to the pane's app), so
+/// the terminal never sees a plain click on the OSC 8 link it is drawing. Opening
+/// it here makes a plain click work in any terminal, with or without tmux's
+/// `hyperlinks` feature; the OSC 8 copy remains for a bypass-modifier click.
+fn card_link(app: &App, column: u16, row: u16) -> Option<String> {
+    let top = app.card_top()?;
+    let row = row.checked_sub(top)?;
+    ui::card::link_at(&app.card, column, row).map(str::to_owned)
+}
+
+/// Hand a URL to the desktop. Spawned and forgotten: the browser is not ours to
+/// wait for, and a missing opener (a headless box) is simply nothing happening.
+/// On a remote tmux this opens nothing on your machine — that case is what the
+/// OSC 8 link and a bypass-modifier click are for.
+fn open_url(url: &str) {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::StatusFilter;
-    use crate::ui;
     use crate::model::{
         AgentKind, AgentState, AgentStatus, PaneInfo, SessionGroup, StatusSource, WindowInfo,
     };
@@ -759,6 +791,73 @@ mod tests {
         // Far below the last row.
         assert!(!click(&mut app, 200, MouseButton::Left));
         assert_eq!(app.selected, 1);
+    }
+
+    /// `fixture(n)` with the card up, focus on its first pane, and a PR known for it.
+    fn card_fixture(count: usize) -> (App, Worker) {
+        let (mut app, worker) = fixture(count);
+        let first = app.list.blocks[0].target.pane_id.clone();
+        for pane in app
+            .sessions
+            .iter_mut()
+            .flat_map(|s| &mut s.windows)
+            .flat_map(|w| &mut w.panes)
+        {
+            pane.branch = "feat".to_owned();
+        }
+        app.show_card = true;
+        app.apply_focus(Some(first));
+        app.apply_context(
+            ("/tmp".to_owned(), "feat".to_owned()),
+            crate::forge::RepoContext {
+                web: Some("https://github.com/o/r".to_owned()),
+                pr: Some(crate::forge::PullRequest {
+                    number: 9,
+                    title: "Ship it".to_owned(),
+                    url: "https://github.com/o/r/pull/9".to_owned(),
+                    state: crate::forge::PrState::Open,
+                }),
+            },
+        );
+        app.rebuild();
+        (app, worker)
+    }
+
+    #[test]
+    fn a_click_on_a_card_link_finds_its_url() {
+        // tmux hands every click to the sidebar, so the terminal never gets to open
+        // the OSC 8 link itself; this is what makes a plain click work.
+        let (app, worker) = card_fixture(3);
+        let _ = &worker;
+        let top = app.card_top().expect("card is up at 40 rows");
+        let pr_row = top + 2;
+        let col = app.card.plain[2].find('#').unwrap() as u16 - 2; // `●` is 3 bytes
+        assert_eq!(card_link(&app, col, pr_row).as_deref(), Some("https://github.com/o/r/pull/9"));
+        assert_eq!(card_link(&app, 0, pr_row), None);
+        assert_eq!(card_link(&app, col, top), None, "the rule");
+    }
+
+    #[test]
+    fn the_card_follows_focus_not_the_cursor() {
+        // Moving through the list must not rewrite the card under you.
+        let (mut app, worker) = card_fixture(3);
+        let _ = &worker;
+        let before = app.card.plain.clone();
+        app.selected = 2;
+        app.rebuild();
+        assert_eq!(app.card.plain, before);
+    }
+
+    #[test]
+    fn a_click_behind_the_card_selects_nothing() {
+        // A long list scrolls underneath the card; its rows must not be clickable
+        // through it.
+        let (mut app, worker) = card_fixture(40);
+        let _ = &worker;
+        app.selected = 0;
+        let top = app.card_top().unwrap();
+        assert!(!click(&mut app, top + 1, MouseButton::Left));
+        assert_eq!(app.selected, 0);
     }
 
     #[test]

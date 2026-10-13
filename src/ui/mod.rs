@@ -79,7 +79,7 @@ pub fn split_width(surface: Surface, total_width: u16) -> (u16, Option<u16>) {
 pub fn preview_area(surface: Surface, size: (u16, u16)) -> Option<crate::preview::Rect> {
     let (_, preview_width) = split_width(surface, size.0);
     let width = preview_width? as usize;
-    let height = list_height(size.1, HEADER_HEIGHT) as usize;
+    let height = list_height(size.1, 0) as usize;
     (width > 0 && height > 0).then_some(crate::preview::Rect {
         x: 0,
         y: 0,
@@ -90,15 +90,15 @@ pub fn preview_area(surface: Surface, size: (u16, u16)) -> Option<crate::preview
 
 /// Lines reserved at the top and bottom of the pane. Both are fixed so the list
 /// viewport height is stable and scrolling doesn't jump when a count changes. The
-/// context card, when shown, sits under the title and is fixed-height for the
-/// same reason; see [`crate::app::App::header_height`].
+/// context card, when shown, sits above the footer and is fixed-height for the
+/// same reason; see [`crate::app::App::card_height`].
 pub const HEADER_HEIGHT: u16 = 1;
 pub const FOOTER_HEIGHT: u16 = 1;
 
-/// Visible list height for a pane of `total_height` rows under `header` rows of
-/// title and card.
-pub fn list_height(total_height: u16, header: u16) -> u16 {
-    total_height.saturating_sub(header + FOOTER_HEIGHT)
+/// Visible list height for a pane of `total_height` rows, `card` of them given to
+/// the context card.
+pub fn list_height(total_height: u16, card: u16) -> u16 {
+    total_height.saturating_sub(HEADER_HEIGHT + card + FOOTER_HEIGHT)
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -110,10 +110,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let header = Rect { height: HEADER_HEIGHT.min(area.height), ..area };
     frame.render_widget(Paragraph::new(header_line(app, area.width as usize)), header);
 
-    let header_height = app.header_height();
-    if header_height > HEADER_HEIGHT && area.height > header_height {
+    if let Some(top) = app.card_top() {
         let card_area = Rect {
-            y: area.y + HEADER_HEIGHT,
+            y: area.y + top,
             height: card::HEIGHT,
             ..area
         };
@@ -121,8 +120,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         link_cells(frame.buffer_mut(), card_area, &app.card.links);
     }
 
+    let header_height = HEADER_HEIGHT;
     let (list_width, preview_width) = split_width(app.surface, area.width);
-    let list_rows = list_height(area.height, header_height);
+    let list_rows = list_height(area.height, app.card_height());
 
     if let Some(preview_width) = preview_width
         && list_rows > 0
@@ -547,16 +547,16 @@ mod tests {
         assert!(preview_area(Surface::Popup, (200, 2)).is_none(), "no rows");
         let area = preview_area(Surface::Popup, (200, 50)).unwrap();
         assert_eq!(area.width, (200 - LIST_WIDTH) as usize);
-        assert_eq!(area.height, list_height(50, HEADER_HEIGHT) as usize);
+        assert_eq!(area.height, list_height(50, 0) as usize);
     }
 
     #[test]
     fn list_height_reserves_the_header_and_footer_without_underflowing() {
-        assert_eq!(list_height(40, HEADER_HEIGHT), 38);
-        assert_eq!(list_height(2, HEADER_HEIGHT), 0);
-        assert_eq!(list_height(1, HEADER_HEIGHT), 0);
-        assert_eq!(list_height(0, HEADER_HEIGHT), 0);
-        assert_eq!(list_height(40, HEADER_HEIGHT + card::HEIGHT), 34);
+        assert_eq!(list_height(40, 0), 38);
+        assert_eq!(list_height(2, 0), 0);
+        assert_eq!(list_height(1, 0), 0);
+        assert_eq!(list_height(0, 0), 0);
+        assert_eq!(list_height(40, card::HEIGHT), 35);
     }
 
     // ─── preview styling ──────────────────────────────────────────────

@@ -1,17 +1,16 @@
-//! The context card: where the selected pane is working, on the web.
+//! The context card: where the focused pane is working, on the web.
 //!
 //! ```text
-//!  flugo                  FLU-88
-//!  ⎇ pete/stack-ports
-//!  ● #142 Derive ports from the…
 //! ──────────────────────────────
+//!  flugo · pete/stack-ports FLU-88
+//!  ● #142 Derive ports from the…
 //! ```
 //!
-//! Folder and ticket, branch, pull request — each a terminal hyperlink where there
-//! is somewhere to go. The card is always [`HEIGHT`] rows, whatever it has to say,
-//! because the list below it is what you navigate: a card that grew a row when you
-//! moved onto a pane with a PR would shift every row under the cursor you just
-//! moved.
+//! Pinned above the footer, and it follows **tmux focus**, not the cursor: it
+//! changes when you actually switch panes, never while you `j`/`k` through the
+//! list. Folder, branch, ticket and pull request are each a link where there is
+//! somewhere to go. The card is always [`HEIGHT`] rows whatever it has to say, so
+//! the list above it never changes height.
 //!
 //! Pure, like [`super::rows`]: a pane and what is known about it in, lines and
 //! link spans out.
@@ -25,7 +24,7 @@ use crate::ui::text::{pad_to, truncate, width};
 use crate::ui::theme::Theme;
 
 /// Rows the card occupies, rule included.
-pub const HEIGHT: u16 = 4;
+pub const HEIGHT: u16 = 3;
 
 /// Below this many rows in the pane the card gives its space back to the list.
 /// A sidebar this short is being used as a status strip, not a dashboard.
@@ -83,12 +82,12 @@ pub fn build(
 ) -> Card {
     let mut card = Card::default();
     let muted = Style::default().fg(theme.muted);
+    push_rule(&mut card, total_width, theme);
 
     let Some(pane) = pane else {
-        for _ in 0..HEIGHT - 1 {
+        for _ in 1..HEIGHT {
             push(&mut card, total_width, Vec::new(), Vec::new());
         }
-        push_rule(&mut card, total_width, theme);
         return card;
     };
 
@@ -98,8 +97,7 @@ pub fn build(
     };
     let pr = context.and_then(|c| c.pr.as_ref());
 
-    // Row 1: folder, and the ticket pinned right where the eye lands after it.
-    let folder = folder_name(&pane.current_path);
+    // Row 1: folder · branch, with the ticket pinned right.
     let ticket = tickets.find(
         [pane.branch.as_str()]
             .into_iter()
@@ -108,41 +106,27 @@ pub fn build(
     let right = match ticket {
         Some(key) => {
             let url = tickets.link(&key);
-            let style = Style::default().fg(theme.badge_plan);
-            vec![Segment::new(key, if url.is_some() { style.add_modifier(Modifier::UNDERLINED) } else { style }).link(url)]
+            vec![Segment::new(key, link_style(theme.badge_plan, url.is_some())).link(url)]
         }
         None => Vec::new(),
     };
     let folder_url = context.and_then(|c| c.web.clone());
-    let left = vec![Segment::new(
-        folder,
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD),
+    let mut left = vec![Segment::new(
+        folder_name(&pane.current_path),
+        link_style(theme.text, folder_url.is_some()).add_modifier(Modifier::BOLD),
     )
     .link(folder_url)];
+    if !pane.branch.is_empty() {
+        let url = context.and_then(|c| c.branch_url(&pane.branch));
+        left.push(Segment::new(" · ", muted));
+        left.push(Segment::new(pane.branch.clone(), link_style(theme.branch, url.is_some())).link(url));
+    }
     push(&mut card, total_width, left, right);
 
-    // Row 2: branch, linked to its PR when there is one.
-    let branch_row = if pane.branch.is_empty() {
-        vec![Segment::new("not a git repo", muted)]
-    } else {
-        let url = context.and_then(|c| c.branch_url(&pane.branch));
-        let mut label = pane.branch.clone();
-        if !pane.worktree.is_empty() {
-            label = format!("{label} ~{}", pane.worktree);
-        }
-        vec![
-            Segment::new("⎇ ", Style::default().fg(theme.branch)),
-            Segment::new(label, link_style(theme.branch, url.is_some())).link(url),
-        ]
-    };
-    push(&mut card, total_width, branch_row, Vec::new());
-
-    // Row 3: the pull request, or why there is none to show.
+    // Row 2: the pull request, or why there is none to show.
     let pr_row = match (pane.branch.is_empty(), lookup, pr) {
-        (true, _, _) => Vec::new(),
-        (false, Lookup::Pending, _) => vec![Segment::new("… looking for a PR", muted)],
+        (true, _, _) => vec![Segment::new("not a git repo", muted)],
+        (false, Lookup::Pending, _) => vec![Segment::new("…", muted)],
         (false, Lookup::Done(_), None) => vec![Segment::new("no pull request", muted)],
         (false, Lookup::Done(_), Some(pr)) => {
             let (glyph, color) = pr_glyph(pr.state, theme);
@@ -157,9 +141,15 @@ pub fn build(
         }
     };
     push(&mut card, total_width, pr_row, Vec::new());
-
-    push_rule(&mut card, total_width, theme);
     card
+}
+
+/// The link under a card-local cell, if any.
+pub fn link_at(card: &Card, col: u16, row: u16) -> Option<&str> {
+    card.links
+        .iter()
+        .find(|l| l.row == row && col >= l.col && col < l.col + l.width)
+        .map(|l| l.url.as_str())
 }
 
 fn link_style(color: Color, linked: bool) -> Style {
@@ -327,15 +317,19 @@ mod tests {
             40,
             &Theme::default(),
         );
-        assert!(card.plain[0].starts_with(" flugo"));
-        assert!(card.plain[0].trim_end().ends_with("FLU-88"));
+        assert!(card.plain[0].starts_with('─'));
+        assert!(card.plain[1].starts_with(" flugo · pete/flu-88-ports"));
+        assert!(card.plain[1].trim_end().ends_with("FLU-88"));
         assert!(card.plain[2].contains("#142 Derive ports"));
         let urls: Vec<&str> = card.links.iter().map(|l| l.url.as_str()).collect();
         assert!(urls.contains(&"https://github.com/o/flugo"));
         assert!(urls.contains(&"https://t/FLU-88"));
         // The branch goes to the PR, not the tree, once a PR exists.
-        let branch = card.links.iter().find(|l| l.row == 1).unwrap();
-        assert_eq!(branch.url, "https://github.com/o/flugo/pull/142");
+        let branch_col = card.plain[1].find("pete/").unwrap() as u16 - 1; // `·` is 3 bytes, 1 cell
+        assert_eq!(link_at(&card, branch_col, 1), Some("https://github.com/o/flugo/pull/142"));
+        assert_eq!(link_at(&card, 1, 1), Some("https://github.com/o/flugo"));
+        assert_eq!(link_at(&card, 0, 1), None, "the margin is not a link");
+        assert_eq!(link_at(&card, 1, 0), None, "the rule is not a link");
     }
 
     #[test]
@@ -365,7 +359,7 @@ mod tests {
             40,
             &Theme::default(),
         );
-        assert!(card.plain[0].contains("FLU-91"));
+        assert!(card.plain[1].contains("FLU-91"));
     }
 
     #[test]
@@ -377,8 +371,8 @@ mod tests {
             40,
             &Theme::default(),
         );
-        assert!(card.plain[0].contains("FLU-1"));
-        assert!(card.links.iter().all(|l| l.row != 0 || !l.url.contains("FLU")));
+        assert!(card.plain[1].contains("FLU-1"));
+        assert!(card.links.iter().all(|l| !l.url.contains("FLU")));
     }
 
     #[test]
@@ -386,7 +380,7 @@ mod tests {
         let none = RepoContext::default();
         let pending = build(Some(&pane("/r", "b")), Lookup::Pending, &tickets(), 30, &Theme::default());
         let done = build(Some(&pane("/r", "b")), Lookup::Done(&none), &tickets(), 30, &Theme::default());
-        assert!(pending.plain[2].contains("looking"));
+        assert!(pending.plain[2].trim() == "…");
         assert!(done.plain[2].contains("no pull request"));
     }
 }

@@ -381,7 +381,12 @@ tmux-resurrect integration. The docs this section used to point at,
 `~/agents/plans/tmux-agent-mgr-plan.md`, no longer exist. Do not go looking for them.
 
 This fork adds the **context card** (`forge.rs`, `ui/card.rs`): folder, branch, PR
-and ticket for the selected pane, as OSC 8 hyperlinks, atop the sidebar. It is the
+and ticket for the *focused* pane, pinned above the footer. It follows tmux focus,
+not the cursor — an earlier version followed the cursor from the top of the
+sidebar and rewrote itself on every `j`/`k`, which read as the screen jumping.
+Clicks on its links are handled in `app/input.rs` (`card_link` → `open`), because
+under `mouse on` the terminal never sees a plain click; the OSC 8 copy is for
+remote tmux, where only the terminal can open anything locally. It is the
 "PR fetching" the out-of-scope list above rules out upstream, which is why it lives
 here. Three things about it are load-bearing:
 

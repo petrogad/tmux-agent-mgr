@@ -153,18 +153,21 @@ Window tabs also carry a rolled-up status glyph, appended to your existing
 ### The context card
 
 ```
- flugo                     FLU-88
- ⎇ pete/flu-88-stack-ports
- ● #142 Derive ports from the bra…
 ──────────────────────────────────
+ flugo · pete/flu-88-ports  FLU-88
+ ● #142 Derive ports from the bra…
+ all
 ```
 
-The pane under the cursor, on the web: its folder (→ the repo), branch (→ its PR,
-else the branch), pull request (`●` open, `○` draft, `✓` merged, `✕` closed) and the
-ticket key found in the branch or PR title. Each is a terminal hyperlink. With tmux
-`mouse on`, open one with your terminal's bypass modifier — **Shift-click** in
-WezTerm, iTerm2 and kitty. The plugin adds `hyperlinks` to tmux's
-`terminal-features` for you, since tmux drops links otherwise.
+Pinned above the footer: the pane **tmux focus** is on, on the web. It follows
+focus rather than the cursor, so it changes when you switch panes and stays put
+while you move through the list. Folder (→ the repo), branch (→ its PR, else the
+branch), pull request (`●` open, `○` draft, `✓` merged, `✕` closed) and the
+ticket key found in the branch or PR title. **Click** any of them to open it — the
+sidebar opens the URL itself (`open` / `xdg-open`). They are also OSC 8
+hyperlinks, which is what a bypass-modifier click (Shift in WezTerm) uses when
+tmux runs on a remote host; the plugin adds `hyperlinks` to tmux's
+`terminal-features` for that.
 
 PRs come from [`gh`](https://cli.github.com/), so it needs to be installed and
 authenticated; without it the card still shows folder, branch and ticket. Lookups

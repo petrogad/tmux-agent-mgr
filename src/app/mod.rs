@@ -262,12 +262,18 @@ impl App {
     }
 
     pub fn list_height(&self) -> usize {
-        ui::list_height(self.size.1, self.header_height()) as usize
+        ui::list_height(self.size.1, self.card_height()) as usize
     }
 
-    /// Rows above the list: the title, plus the card when it is showing.
-    pub fn header_height(&self) -> u16 {
-        ui::HEADER_HEIGHT + if self.card_visible() { card::HEIGHT } else { 0 }
+    /// Rows the card takes above the footer, or 0 when it is not showing.
+    pub fn card_height(&self) -> u16 {
+        if self.card_visible() { card::HEIGHT } else { 0 }
+    }
+
+    /// First pane row of the card, when it is showing.
+    pub fn card_top(&self) -> Option<u16> {
+        self.card_visible()
+            .then(|| self.size.1.saturating_sub(ui::FOOTER_HEIGHT + card::HEIGHT))
     }
 
     /// The card is a sidebar thing: the popup has a preview doing the same job
@@ -278,9 +284,10 @@ impl App {
             && self.size.1 >= card::MIN_PANE_HEIGHT
     }
 
-    /// The pane the cursor is on, as the tree has it.
-    fn selected_pane_info(&self) -> Option<&PaneInfo> {
-        let pane_id = self.selected_pane()?;
+    /// The pane tmux focus is on, as the tree has it. The card follows this rather
+    /// than the cursor so it only changes when you actually switch panes.
+    fn focused_pane_info(&self) -> Option<&PaneInfo> {
+        let pane_id = self.focused.as_deref()?;
         self.sessions
             .iter()
             .flat_map(|session| &session.windows)
@@ -288,13 +295,13 @@ impl App {
             .find(|pane| pane.pane_id == pane_id)
     }
 
-    /// What the context thread should look up: the selected pane's checkout, when
+    /// What the context thread should look up: the focused pane's checkout, when
     /// the card is up and the pane is on a branch at all.
     pub fn context_target(&self) -> Option<ContextKey> {
         if !self.card_visible() {
             return None;
         }
-        let pane = self.selected_pane_info()?;
+        let pane = self.focused_pane_info()?;
         (!pane.branch.is_empty()).then(|| (pane.current_path.clone(), pane.branch.clone()))
     }
 
@@ -312,7 +319,7 @@ impl App {
             self.card = card::Card::default();
             return;
         }
-        let pane = self.selected_pane_info();
+        let pane = self.focused_pane_info();
         let none = RepoContext::default();
         let lookup = match pane {
             Some(pane) if pane.branch.is_empty() => card::Lookup::Done(&none),
