@@ -138,6 +138,11 @@ pub mod conf_only {
     pub const CFG_KEY_FOCUS: &str = "@agent_mgr_key_focus";
     /// Prefix-less key opening the full-screen popup; `none` binds nothing.
     pub const CFG_KEY_POPUP: &str = "@agent_mgr_key_popup";
+    /// Prefix key opening the current pane's PR (else its branch, else its repo);
+    /// `none` binds nothing.
+    pub const CFG_KEY_OPEN: &str = "@agent_mgr_key_open";
+    /// Prefix key opening the current pane's ticket; `none` binds nothing.
+    pub const CFG_KEY_TICKET: &str = "@agent_mgr_key_ticket";
     /// When not `off`, append `agent-mgr restore` to tmux-resurrect's
     /// `post-restore-all` hook, so sidebars come back with the session instead of
     /// as the plain shells resurrect leaves behind. See [`crate::resurrect`].
@@ -249,6 +254,8 @@ mod tests {
             conf_only::CFG_KEY_ALL,
             conf_only::CFG_KEY_FOCUS,
             conf_only::CFG_KEY_POPUP,
+            conf_only::CFG_KEY_OPEN,
+            conf_only::CFG_KEY_TICKET,
             conf_only::CFG_RESURRECT,
             conf_only::RESURRECT_HOOK,
             conf_only::HAS_POPUP,

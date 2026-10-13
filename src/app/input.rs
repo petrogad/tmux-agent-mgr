@@ -22,7 +22,7 @@ pub fn handle(event: Event, app: &mut App, worker: &Worker) {
             MouseEventKind::Down(button) => {
                 if let Some(url) = card_link(app, mouse.column, mouse.row) {
                     if button == MouseButton::Left {
-                        open_url(&url);
+                        crate::forge::open_url(&url);
                     }
                 } else if click(app, mouse.row, button) {
                     app.activate_selection();
@@ -235,20 +235,6 @@ fn card_link(app: &App, column: u16, row: u16) -> Option<String> {
     let top = app.card_top()?;
     let row = row.checked_sub(top)?;
     ui::card::link_at(&app.card, column, row).map(str::to_owned)
-}
-
-/// Hand a URL to the desktop. Spawned and forgotten: the browser is not ours to
-/// wait for, and a missing opener (a headless box) is simply nothing happening.
-/// On a remote tmux this opens nothing on your machine — that case is what the
-/// OSC 8 link and a bypass-modifier click are for.
-fn open_url(url: &str) {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let _ = std::process::Command::new(opener)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
 
 #[cfg(test)]

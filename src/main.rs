@@ -24,6 +24,7 @@ mod git;
 mod hook;
 mod model;
 mod nav;
+mod open;
 mod pane;
 mod preview;
 mod resurrect;
@@ -58,6 +59,7 @@ fn main() {
         Some("restore") => resurrect::cmd_restore(&rest),
         Some("daemon") => daemon::cmd_daemon(&rest),
         Some("hook") => hook::cmd_hook(&rest),
+        Some("open") => open::cmd_open(&rest),
         // The two TUI entry points. Same loop, same keymap; the surface decides
         // width, whether a preview is worth its cost, and whether jumping to a
         // pane also closes us.

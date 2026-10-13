@@ -154,7 +154,7 @@ fn ttl(context: &RepoContext) -> Duration {
 
 /// Ask git for the remote and root, and `gh` for the PR. The `gh` call is skipped
 /// when there is no forge to ask.
-fn lookup(path: &str, branch: &str) -> RepoContext {
+pub fn lookup(path: &str, branch: &str) -> RepoContext {
     let web = run("git", path, &["remote", "get-url", "origin"])
         .as_deref()
         .and_then(web_url);
@@ -292,6 +292,18 @@ fn closing_issue(body: &str) -> Option<u64> {
             .collect();
         digits.parse().ok()
     })
+}
+
+/// Hand a URL to the desktop. Spawned and forgotten: the browser is not ours to
+/// wait for, and a missing opener (a headless box) is simply nothing happening.
+pub fn open_url(url: &str) {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn run(program: &str, path: &str, args: &[&str]) -> Option<String> {
