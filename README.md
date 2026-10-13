@@ -180,6 +180,10 @@ through the list. Three rows, broad to specific:
 (Shift in WezTerm) uses when tmux runs on a remote host; the plugin adds
 `hyperlinks` to tmux's `terminal-features` for that.
 
+From the keyboard, in any pane: **`prefix g`** opens its PR (else the branch, else
+the repo) and **`prefix G`** its ticket. Like a click, this opens the URL where tmux
+runs, and says what it opened — or why there was nothing — in the message line.
+
 PRs come from [`gh`](https://cli.github.com/), so it needs to be installed and
 authenticated; without it the card still shows folder, branch and ticket. Lookups
 are cached for a minute — 20 s while checks are running — and never block the
@@ -213,6 +217,8 @@ Set these **before** the plugin loads; it only fills in what you haven't.
 | `@agent_mgr_key_all` | `E` | prefix key toggling it everywhere |
 | `@agent_mgr_key_focus` | `o` | prefix key jumping into the sidebar and back; `none` binds nothing |
 | `@agent_mgr_key_popup` | `C-n` | prefix-less popup key; `none` binds nothing |
+| `@agent_mgr_key_open` | `g` | prefix key opening this pane's PR, else its branch or repo; `none` binds nothing |
+| `@agent_mgr_key_ticket` | `G` | prefix key opening this pane's ticket; `none` binds nothing |
 | `@agent_mgr_card` | `on` | the context card atop the sidebar (below) |
 | `@agent_mgr_ticket_url` | *unset* | ticket link, `{key}` replaced: `https://acme.atlassian.net/browse/{key}` |
 | `@agent_mgr_ticket_prefixes` | *unset* | project keys to find in branch names, any case: `GRPS FLU`. Unset: any uppercase `ABC-123` |
