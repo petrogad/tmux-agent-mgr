@@ -113,8 +113,6 @@ pub const CFG_AGENTS_ONLY: &str = "@agent_mgr_agents_only";
 /// When not `off`, show the context card — folder, branch, PR, ticket — at the
 /// top of the sidebar.
 pub const CFG_CARD: &str = "@agent_mgr_card";
-/// Colour scheme: unset for the terminal's own palette, `mocha` for Catppuccin.
-pub const CFG_THEME: &str = "@agent_mgr_theme";
 /// Ticket URL template, with `{key}` where the key goes. Unset shows keys unlinked.
 pub const CFG_TICKET_URL: &str = "@agent_mgr_ticket_url";
 /// Project keys to recognise case-insensitively, e.g. `GRPS FLU`. Unset accepts
@@ -243,7 +241,6 @@ mod tests {
             CFG_POSITION,
             CFG_AGENTS_ONLY,
             CFG_CARD,
-            CFG_THEME,
             CFG_TICKET_URL,
             CFG_TICKET_PREFIXES,
             conf_only::CFG_TAB_STATUS,

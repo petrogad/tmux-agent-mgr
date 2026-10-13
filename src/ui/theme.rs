@@ -1,10 +1,12 @@
 //! Colors and status glyphs.
 //!
 //! Defaults are indexed ANSI colors rather than RGB so they inherit the user's
-//! terminal palette and stay legible on both light and dark backgrounds.
-//! `@agent_mgr_theme mocha` swaps in Catppuccin Mocha instead — truecolor, and
-//! dark-only, which is why it is opt-in. Every entry is then still overridable
-//! through an `@agent_mgr_color_*` tmux option.
+//! terminal palette and stay legible on both light and dark backgrounds. Every
+//! entry is overridable through an `@agent_mgr_color_*` tmux option.
+//!
+//! The context card is the exception: it has a [`CardPalette`] of its own, in
+//! Catppuccin Mocha truecolor, so its pieces read as distinct at a glance without
+//! recolouring the list above it.
 
 use ratatui::style::Color;
 
@@ -42,10 +44,7 @@ pub struct Theme {
     pub wait_reason: Color,
     pub subagent: Color,
     pub task_progress: Color,
-    /// The context card's working directory.
-    pub folder: Color,
-    /// Dividers: the rule above the context card.
-    pub rule: Color,
+    pub card: CardPalette,
 }
 
 impl Default for Theme {
@@ -72,76 +71,73 @@ impl Default for Theme {
             wait_reason: Color::Indexed(209),
             subagent: Color::Indexed(146),
             task_progress: Color::Indexed(115),
-            folder: Color::Indexed(117),
-            rule: Color::Indexed(238),
+            card: CardPalette::default(),
         }
     }
 }
 
-/// Catppuccin Mocha, by role. Named so the mapping below reads as a palette
+/// The Catppuccin Mocha hues the card uses. Named so the mapping below reads as a palette
 /// choice rather than a column of hex.
 mod mocha {
     use ratatui::style::Color;
     pub const PINK: Color = Color::Rgb(0xf5, 0xc2, 0xe7);
     pub const MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
     pub const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
-    pub const MAROON: Color = Color::Rgb(0xeb, 0xa0, 0xac);
-    pub const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
-    pub const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
     pub const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
-    pub const TEAL: Color = Color::Rgb(0x94, 0xe2, 0xd5);
     pub const SKY: Color = Color::Rgb(0x89, 0xdc, 0xeb);
     pub const SAPPHIRE: Color = Color::Rgb(0x74, 0xc7, 0xec);
-    pub const BLUE: Color = Color::Rgb(0x89, 0xb4, 0xfa);
-    pub const LAVENDER: Color = Color::Rgb(0xb4, 0xbe, 0xfe);
     pub const TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
     pub const SUBTEXT0: Color = Color::Rgb(0xa6, 0xad, 0xc8);
     pub const OVERLAY1: Color = Color::Rgb(0x7f, 0x84, 0x9c);
     pub const OVERLAY0: Color = Color::Rgb(0x6c, 0x70, 0x86);
     pub const SURFACE1: Color = Color::Rgb(0x45, 0x47, 0x5a);
-    pub const SURFACE0: Color = Color::Rgb(0x31, 0x32, 0x44);
 }
 
-impl Theme {
-    /// Catppuccin Mocha. Mauve leads as the accent, each agent state gets its own
-    /// hue, and the context card's pieces — folder, branch, PR, ticket — are four
-    /// distinct colours so the row reads at a glance.
-    pub fn mocha() -> Self {
+/// The context card's colours. Catppuccin Mocha, one hue per piece: the card is
+/// four kinds of link side by side, and colour is what tells them apart.
+#[derive(Clone, Copy, Debug)]
+pub struct CardPalette {
+    pub repo: Color,
+    pub owner: Color,
+    pub branch: Color,
+    pub folder: Color,
+    pub number: Color,
+    pub title: Color,
+    pub ticket: Color,
+    pub muted: Color,
+    pub open: Color,
+    pub draft: Color,
+    pub merged: Color,
+    pub closed: Color,
+    pub rule: Color,
+}
+
+impl Default for CardPalette {
+    fn default() -> Self {
         use mocha::*;
         Self {
-            accent: MAUVE,
-            session: BLUE,
-            window: SUBTEXT0,
-            selection_bg: SURFACE0,
-            text: TEXT,
-            muted: OVERLAY1,
-            working: YELLOW,
-            blocked: RED,
-            idle: GREEN,
-            done: TEAL,
-            error: MAROON,
-            unknown: OVERLAY0,
-            agent_claude: PEACH,
-            agent_codex: SKY,
+            repo: TEXT,
+            owner: OVERLAY1,
             branch: PINK,
-            badge_plan: SAPPHIRE,
-            badge_auto: GREEN,
-            badge_danger: RED,
-            wait_reason: PEACH,
-            subagent: LAVENDER,
-            task_progress: TEAL,
             folder: SKY,
+            number: MAUVE,
+            title: SUBTEXT0,
+            ticket: SAPPHIRE,
+            muted: OVERLAY0,
+            open: GREEN,
+            draft: OVERLAY1,
+            merged: MAUVE,
+            closed: RED,
             rule: SURFACE1,
         }
     }
+}
 
+impl Theme {
     /// Read overrides from `@agent_mgr_color_*`. One `show -g` would be cheaper
     /// than one call per color, but this runs once at startup, so clarity wins.
     pub fn from_tmux() -> Self {
-        let mut theme = match tmux::global(tmux::CFG_THEME).as_deref() {
-            Some("mocha") => Self::mocha(),
-            _ => Self::default(),
-        };
+        let mut theme = Self::default();
         let overrides: [(&str, &mut Color); 8] = [
             ("accent", &mut theme.accent),
             ("session", &mut theme.session),

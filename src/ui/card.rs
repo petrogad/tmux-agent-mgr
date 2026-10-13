@@ -83,7 +83,8 @@ pub fn build(
     theme: &Theme,
 ) -> Card {
     let mut card = Card::default();
-    let muted = Style::default().fg(theme.muted);
+    let palette = &theme.card;
+    let muted = Style::default().fg(palette.muted);
     push_rule(&mut card, total_width, theme);
 
     let Some(pane) = pane else {
@@ -106,7 +107,7 @@ pub fn build(
         let url = context.and_then(|c| c.branch_url(&pane.branch));
         vec![
             Segment::new(" · ", muted),
-            Segment::new(format!("⎇ {}", pane.branch), link_style(theme.branch, url.is_some()))
+            Segment::new(format!("⎇ {}", pane.branch), link_style(palette.branch, url.is_some()))
                 .link(url),
         ]
     });
@@ -121,14 +122,14 @@ pub fn build(
             });
             let mut row = Vec::new();
             if wanted <= total_width {
-                row.push(Segment::new(owner, muted).link(repo_url.clone()));
+                row.push(Segment::new(owner, Style::default().fg(palette.owner)).link(repo_url.clone()));
             }
-            row.push(Segment::new(name, bold(theme.text)).link(repo_url));
+            row.push(Segment::new(name, bold(palette.repo)).link(repo_url));
             row
         }
         None => vec![Segment::new(
             folder_name(&pane.current_path),
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            Style::default().fg(palette.repo).add_modifier(Modifier::BOLD),
         )],
     };
     repo_row.extend(branch.into_iter().flatten());
@@ -139,8 +140,8 @@ pub fn build(
     let folder_url = context.and_then(|c| c.folder_url(&pane.branch, &pane.current_path));
     let path = truncate_left(&home_relative(&pane.current_path), total_width.saturating_sub(4));
     let place = vec![
-        Segment::new("▸ ", Style::default().fg(theme.folder)),
-        Segment::new(path, link_style(theme.folder, folder_url.is_some())).link(folder_url),
+        Segment::new("▸ ", Style::default().fg(palette.folder)),
+        Segment::new(path, link_style(palette.folder, folder_url.is_some())).link(folder_url),
     ];
     push(&mut card, total_width, place, Vec::new());
 
@@ -152,12 +153,12 @@ pub fn build(
     ) {
         Some(key) => {
             let url = tickets.link(&key);
-            vec![Segment::new(key, link_style(theme.badge_plan, url.is_some())).link(url)]
+            vec![Segment::new(key, link_style(palette.ticket, url.is_some())).link(url)]
         }
         None => match (pr.and_then(|pr| pr.closes), context) {
             (Some(issue), Some(context)) => {
                 let url = context.issue_url(issue);
-                vec![Segment::new(format!("◎ #{issue}"), link_style(theme.badge_plan, url.is_some())).link(url)]
+                vec![Segment::new(format!("◎ #{issue}"), link_style(palette.ticket, url.is_some())).link(url)]
             }
             _ => Vec::new(),
         },
@@ -171,10 +172,10 @@ pub fn build(
             let url = Some(pr.url.clone());
             vec![
                 Segment::new(format!("{glyph} "), Style::default().fg(color)),
-                Segment::new(format!("#{}", pr.number), link_style(theme.accent, true))
+                Segment::new(format!("#{}", pr.number), link_style(palette.number, true))
                     .link(url.clone()),
                 Segment::new(" ", Style::default()),
-                Segment::new(pr.title.clone(), Style::default().fg(theme.text)).link(url),
+                Segment::new(pr.title.clone(), Style::default().fg(palette.title)).link(url),
             ]
         }
     };
@@ -231,10 +232,10 @@ fn link_style(color: Color, linked: bool) -> Style {
 
 fn pr_glyph(state: PrState, theme: &Theme) -> (&'static str, Color) {
     match state {
-        PrState::Open => ("●", theme.idle),
-        PrState::Draft => ("○", theme.muted),
-        PrState::Merged => ("✓", theme.badge_plan),
-        PrState::Closed => ("✕", theme.blocked),
+        PrState::Open => ("●", theme.card.open),
+        PrState::Draft => ("○", theme.card.draft),
+        PrState::Merged => ("✓", theme.card.merged),
+        PrState::Closed => ("✕", theme.card.closed),
     }
 }
 
@@ -304,7 +305,7 @@ fn push(card: &mut Card, total_width: usize, left: Vec<Segment>, right: Vec<Segm
 fn push_rule(card: &mut Card, total_width: usize, theme: &Theme) {
     let rule = "─".repeat(total_width);
     card.plain.push(rule.clone());
-    card.lines.push(Line::from(Span::styled(rule, Style::default().fg(theme.rule))));
+    card.lines.push(Line::from(Span::styled(rule, Style::default().fg(theme.card.rule))));
 }
 
 #[cfg(test)]
