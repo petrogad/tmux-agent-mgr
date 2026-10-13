@@ -3,6 +3,10 @@
 //! Defaults are indexed ANSI colors rather than RGB so they inherit the user's
 //! terminal palette and stay legible on both light and dark backgrounds. Every
 //! entry is overridable through an `@agent_mgr_color_*` tmux option.
+//!
+//! The context card is the exception: it has a [`CardPalette`] of its own, in
+//! Catppuccin Mocha truecolor, so its pieces read as distinct at a glance without
+//! recolouring the list above it.
 
 use ratatui::style::Color;
 
@@ -40,6 +44,7 @@ pub struct Theme {
     pub wait_reason: Color,
     pub subagent: Color,
     pub task_progress: Color,
+    pub card: CardPalette,
 }
 
 impl Default for Theme {
@@ -66,6 +71,76 @@ impl Default for Theme {
             wait_reason: Color::Indexed(209),
             subagent: Color::Indexed(146),
             task_progress: Color::Indexed(115),
+            card: CardPalette::default(),
+        }
+    }
+}
+
+/// The Catppuccin Mocha hues the card uses. Named so the mapping below reads as a palette
+/// choice rather than a column of hex.
+mod mocha {
+    use ratatui::style::Color;
+    pub const PINK: Color = Color::Rgb(0xf5, 0xc2, 0xe7);
+    pub const MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
+    pub const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+    pub const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
+    pub const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
+    pub const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
+    pub const SKY: Color = Color::Rgb(0x89, 0xdc, 0xeb);
+    pub const SAPPHIRE: Color = Color::Rgb(0x74, 0xc7, 0xec);
+    pub const TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
+    pub const SUBTEXT0: Color = Color::Rgb(0xa6, 0xad, 0xc8);
+    pub const OVERLAY1: Color = Color::Rgb(0x7f, 0x84, 0x9c);
+    pub const OVERLAY0: Color = Color::Rgb(0x6c, 0x70, 0x86);
+    pub const SURFACE1: Color = Color::Rgb(0x45, 0x47, 0x5a);
+}
+
+/// The context card's colours. Catppuccin Mocha, one hue per piece: the card is
+/// four kinds of link side by side, and colour is what tells them apart.
+#[derive(Clone, Copy, Debug)]
+pub struct CardPalette {
+    pub repo: Color,
+    pub owner: Color,
+    pub branch: Color,
+    pub folder: Color,
+    pub number: Color,
+    pub title: Color,
+    pub ticket: Color,
+    pub muted: Color,
+    pub open: Color,
+    pub draft: Color,
+    pub merged: Color,
+    pub closed: Color,
+    pub rule: Color,
+    /// Checks passing / running / failing.
+    pub pass: Color,
+    pub pending: Color,
+    pub fail: Color,
+    /// A review still owed, as against approved (`pass`) or changes (`fail`).
+    pub awaiting: Color,
+}
+
+impl Default for CardPalette {
+    fn default() -> Self {
+        use mocha::*;
+        Self {
+            repo: TEXT,
+            owner: OVERLAY1,
+            branch: PINK,
+            folder: SKY,
+            number: MAUVE,
+            title: SUBTEXT0,
+            ticket: SAPPHIRE,
+            muted: OVERLAY0,
+            open: GREEN,
+            draft: OVERLAY1,
+            merged: MAUVE,
+            closed: RED,
+            rule: SURFACE1,
+            pass: GREEN,
+            pending: YELLOW,
+            fail: RED,
+            awaiting: PEACH,
         }
     }
 }

@@ -150,6 +150,42 @@ itself.
 Window tabs also carry a rolled-up status glyph, appended to your existing
 `window-status-format` without replacing it.
 
+### The context card
+
+```
+──────────────────────────────────
+ petrogad/flugo · ⎇ pete/ports
+ ▸ ~/github/flugo-ports/apps
+ ● #142 ✓ approved Derive p…  FLU-88
+
+```
+
+Pinned above the footer: the pane **tmux focus** is on. It follows focus rather
+than the cursor, so it changes when you switch panes and stays put while you move
+through the list. Three rows, broad to specific:
+
+- **repo** — as the remote names it (→ the repo), and the branch (→ its PR, else
+  the branch)
+- **place** — the working directory in full, trimmed from the left when long
+  (→ that folder on the branch)
+- **work** — the pull request (`●` open, `○` draft, `✓` merged, `✕` closed),
+  flagged while it is live with its checks (`✓` passing, `◌` running, `✕`
+  failing) and review (`approved`, `changes`, `review` still owed), and
+  pinned right, the ticket: a Jira-style key from the branch or PR title (→
+  `@agent_mgr_ticket_url`), else the GitHub issue the PR description closes
+  (`Fixes #12` → `◎ #12`)
+
+**Click** any of them to open it — the sidebar opens the URL itself (`open` /
+`xdg-open`). They are also OSC 8 hyperlinks, which is what a bypass-modifier click
+(Shift in WezTerm) uses when tmux runs on a remote host; the plugin adds
+`hyperlinks` to tmux's `terminal-features` for that.
+
+PRs come from [`gh`](https://cli.github.com/), so it needs to be installed and
+authenticated; without it the card still shows folder, branch and ticket. Lookups
+are cached for a minute — 20 s while checks are running — and never block the
+list. The card hides itself in a pane
+under 16 rows.
+
 ### Global navigation
 
 On by default, and passed through to Vim when the focused pane is running it:
@@ -177,6 +213,9 @@ Set these **before** the plugin loads; it only fills in what you haven't.
 | `@agent_mgr_key_all` | `E` | prefix key toggling it everywhere |
 | `@agent_mgr_key_focus` | `o` | prefix key jumping into the sidebar and back; `none` binds nothing |
 | `@agent_mgr_key_popup` | `C-n` | prefix-less popup key; `none` binds nothing |
+| `@agent_mgr_card` | `on` | the context card atop the sidebar (below) |
+| `@agent_mgr_ticket_url` | *unset* | ticket link, `{key}` replaced: `https://acme.atlassian.net/browse/{key}` |
+| `@agent_mgr_ticket_prefixes` | *unset* | project keys to find in branch names, any case: `GRPS FLU`. Unset: any uppercase `ABC-123` |
 
 Colors take a `#RRGGBB` or a 0–255 palette index:
 `@agent_mgr_color_{accent,session,working,blocked,idle,done,error,branch}`.
