@@ -206,7 +206,7 @@ pub struct App {
 }
 
 impl App {
-    fn new(surface: Surface, own_pane: String, size: (u16, u16)) -> Self {
+    pub(crate) fn new(surface: Surface, own_pane: String, size: (u16, u16)) -> Self {
         Self {
             surface,
             own_pane,

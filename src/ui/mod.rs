@@ -310,6 +310,13 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
         return prompt_line("/", &search.query, total_width, theme.accent, true);
     }
 
+    // Nothing narrowing the list, nothing to say. The footer exists to catch a
+    // filter you forgot you set, and "all" under the context card read as a
+    // stray word rather than as a status.
+    if app.filter == StatusFilter::All && app.search.is_none() {
+        return Line::from(Span::raw(pad_to(0, total_width)));
+    }
+
     let label = filter_label(app.filter).to_owned();
     let hidden = app.hidden_count();
     let mut text = match &app.search {
@@ -321,13 +328,8 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     }
     let text = truncate(&text, total_width);
     let content_width = width(&text);
-    let color = if app.filter == StatusFilter::All && app.search.is_none() {
-        theme.muted
-    } else {
-        theme.accent
-    };
     Line::from(vec![
-        Span::styled(text, Style::default().fg(color)),
+        Span::styled(text, Style::default().fg(theme.accent)),
         Span::raw(pad_to(content_width, total_width)),
     ])
 }
@@ -616,5 +618,18 @@ mod tests {
             Counts::default()
         );
         assert_eq!(Counts::tally(&[]), Counts::default());
+    }
+
+    #[test]
+    fn the_footer_speaks_only_when_something_narrows_the_list() {
+        // Under the context card a bare "all" read as a stray word; a forgotten
+        // filter is what the footer is for, and that must still show.
+        let mut app = App::new(Surface::Sidebar, "%99".to_owned(), (30, 40));
+        let plain = |line: Line| line.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let quiet = plain(footer_line(&app, 30));
+        assert_eq!(quiet.trim(), "");
+        assert_eq!(width(&quiet), 30);
+        app.filter = StatusFilter::Working;
+        assert_eq!(plain(footer_line(&app, 30)).trim(), "working");
     }
 }

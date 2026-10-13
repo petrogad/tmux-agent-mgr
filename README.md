@@ -157,7 +157,7 @@ Window tabs also carry a rolled-up status glyph, appended to your existing
  petrogad/flugo · ⎇ pete/ports
  ▸ ~/github/flugo-ports/apps
  ● #142 ✓ approved Derive p…  FLU-88
- all
+
 ```
 
 Pinned above the footer: the pane **tmux focus** is on. It follows focus rather
