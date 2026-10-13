@@ -156,7 +156,7 @@ Window tabs also carry a rolled-up status glyph, appended to your existing
 ──────────────────────────────────
  petrogad/flugo · ⎇ pete/ports
  ▸ ~/github/flugo-ports/apps
- ● #142 Derive ports from…  FLU-88
+ ● #142 ✓ approved Derive p…  FLU-88
  all
 ```
 
@@ -168,7 +168,9 @@ through the list. Three rows, broad to specific:
   the branch)
 - **place** — the working directory in full, trimmed from the left when long
   (→ that folder on the branch)
-- **work** — the pull request (`●` open, `○` draft, `✓` merged, `✕` closed), and
+- **work** — the pull request (`●` open, `○` draft, `✓` merged, `✕` closed),
+  flagged while it is live with its checks (`✓` passing, `◌` running, `✕`
+  failing) and review (`approved`, `changes`, `review` still owed), and
   pinned right, the ticket: a Jira-style key from the branch or PR title (→
   `@agent_mgr_ticket_url`), else the GitHub issue the PR description closes
   (`Fixes #12` → `◎ #12`)
@@ -180,7 +182,8 @@ through the list. Three rows, broad to specific:
 
 PRs come from [`gh`](https://cli.github.com/), so it needs to be installed and
 authenticated; without it the card still shows folder, branch and ticket. Lookups
-are cached for a minute and never block the list. The card hides itself in a pane
+are cached for a minute — 20 s while checks are running — and never block the
+list. The card hides itself in a pane
 under 16 rows.
 
 ### Global navigation

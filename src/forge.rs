@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 /// How long a lookup is reused. A PR opened a minute ago showing up a minute late
 /// is fine; a `gh` call every second per sidebar is not.
 const TTL: Duration = Duration::from_secs(60);
+/// The shorter reuse while checks are still running, which is the one thing on the
+/// card you are actually waiting to see change.
+const PENDING_TTL: Duration = Duration::from_secs(20);
 
 /// The web side of one `(path, branch)`.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
@@ -68,6 +71,24 @@ pub struct PullRequest {
     pub state: PrState,
     /// The first issue the description says it closes (`Fixes #12`).
     pub closes: Option<u64>,
+    /// Every check rolled into one verdict; `None` when the PR has no checks.
+    pub checks: Option<Checks>,
+    /// `None` when the repo requires no review and nobody has given one.
+    pub review: Option<Review>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Checks {
+    Passing,
+    Pending,
+    Failing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Review {
+    Approved,
+    ChangesRequested,
+    Required,
 }
 
 /// `path` relative to `root`: `Some("")` at the root itself, `None` outside it.
@@ -110,7 +131,7 @@ impl ContextCache {
         resolve: impl FnOnce(&str, &str) -> RepoContext,
     ) -> RepoContext {
         if let Some((fetched_at, context)) = self.entries.get(&(path.to_owned(), branch.to_owned()))
-            && now.duration_since(*fetched_at) < TTL
+            && now.duration_since(*fetched_at) < ttl(context)
         {
             return context.clone();
         }
@@ -126,6 +147,11 @@ impl ContextCache {
     }
 }
 
+fn ttl(context: &RepoContext) -> Duration {
+    let pending = context.pr.as_ref().and_then(|pr| pr.checks) == Some(Checks::Pending);
+    if pending { PENDING_TTL } else { TTL }
+}
+
 /// Ask git for the remote and root, and `gh` for the PR. The `gh` call is skipped
 /// when there is no forge to ask.
 fn lookup(path: &str, branch: &str) -> RepoContext {
@@ -139,7 +165,12 @@ fn lookup(path: &str, branch: &str) -> RepoContext {
         Some(_) if !branch.is_empty() => run(
             "gh",
             path,
-            &["pr", "view", "--json", "number,title,url,state,isDraft,body"],
+            &[
+                "pr",
+                "view",
+                "--json",
+                "number,title,url,state,isDraft,body,statusCheckRollup,reviewDecision",
+            ],
         )
         .as_deref()
         .and_then(parse_pr),
@@ -180,7 +211,7 @@ pub fn web_url(remote: &str) -> Option<String> {
     Some(format!("https://{host}/{path}"))
 }
 
-/// Parse `gh pr view --json number,title,url,state,isDraft,body`.
+/// Parse `gh pr view --json number,title,url,state,isDraft,body,statusCheckRollup,reviewDecision`.
 fn parse_pr(json: &str) -> Option<PullRequest> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let state = match (value["state"].as_str()?, value["isDraft"].as_bool()) {
@@ -196,7 +227,46 @@ fn parse_pr(json: &str) -> Option<PullRequest> {
         url: value["url"].as_str()?.to_owned(),
         state,
         closes: value["body"].as_str().and_then(closing_issue),
+        checks: value["statusCheckRollup"].as_array().and_then(|runs| rollup(runs)),
+        review: match value["reviewDecision"].as_str() {
+            Some("APPROVED") => Some(Review::Approved),
+            Some("CHANGES_REQUESTED") => Some(Review::ChangesRequested),
+            Some("REVIEW_REQUIRED") => Some(Review::Required),
+            _ => None,
+        },
     })
+}
+
+/// One verdict for a PR's checks, the way GitHub's own badge reads: any failure
+/// fails it, else anything unfinished keeps it pending, else it passes.
+///
+/// The rollup mixes two shapes — a `CheckRun` (Actions) has `status` and, once
+/// complete, `conclusion`; a `StatusContext` (the older commit-status API) has
+/// only `state` — so each entry is read by whichever fields it has. Skipped and
+/// neutral runs count as passing, as they do on GitHub.
+fn rollup(runs: &[serde_json::Value]) -> Option<Checks> {
+    if runs.is_empty() {
+        return None;
+    }
+    let mut pending = false;
+    for run in runs {
+        let verdict = run["conclusion"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .or_else(|| run["state"].as_str());
+        match verdict {
+            Some(
+                "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+                | "STARTUP_FAILURE",
+            ) => return Some(Checks::Failing),
+            Some("PENDING" | "EXPECTED") | None => pending = true,
+            Some(_) => {}
+        }
+        if run["status"].as_str().is_some_and(|s| s != "COMPLETED") {
+            pending = true;
+        }
+    }
+    Some(if pending { Checks::Pending } else { Checks::Passing })
 }
 
 /// The first `#N` a PR description closes with GitHub's own keywords.
@@ -401,8 +471,66 @@ mod tests {
             url: "https://github.com/o/r/pull/7".into(),
             state: PrState::Open,
             closes: None,
+            checks: None,
+            review: None,
         });
         assert_eq!(ctx.branch_url("pete/ports").as_deref(), Some("https://github.com/o/r/pull/7"));
+    }
+
+    #[test]
+    fn checks_roll_up_the_way_githubs_badge_does() {
+        let runs = |json: &str| -> Vec<serde_json::Value> { serde_json::from_str(json).unwrap() };
+        let pass = r#"{"status":"COMPLETED","conclusion":"SUCCESS"}"#;
+        let skip = r#"{"status":"COMPLETED","conclusion":"SKIPPED"}"#;
+        let fail = r#"{"status":"COMPLETED","conclusion":"FAILURE"}"#;
+        let running = r#"{"status":"IN_PROGRESS","conclusion":""}"#;
+        let ctx_pending = r#"{"state":"PENDING"}"#;
+        let ctx_ok = r#"{"state":"SUCCESS"}"#;
+        assert_eq!(rollup(&[]), None);
+        assert_eq!(rollup(&runs(&format!("[{pass},{skip},{ctx_ok}]"))), Some(Checks::Passing));
+        assert_eq!(rollup(&runs(&format!("[{pass},{running}]"))), Some(Checks::Pending));
+        assert_eq!(rollup(&runs(&format!("[{pass},{ctx_pending}]"))), Some(Checks::Pending));
+        // A failure is the answer even while other checks are still running.
+        assert_eq!(rollup(&runs(&format!("[{running},{fail},{pass}]"))), Some(Checks::Failing));
+    }
+
+    #[test]
+    fn review_and_checks_are_read_from_the_pr_json() {
+        let pr = parse_pr(
+            r#"{"isDraft":false,"number":3,"state":"OPEN","title":"t","url":"u","body":"",
+                "reviewDecision":"CHANGES_REQUESTED",
+                "statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(pr.review, Some(Review::ChangesRequested));
+        assert_eq!(pr.checks, Some(Checks::Passing));
+        let bare = parse_pr(r#"{"number":1,"state":"OPEN","title":"t","url":"u","reviewDecision":""}"#).unwrap();
+        assert_eq!((bare.checks, bare.review), (None, None));
+    }
+
+    #[test]
+    fn running_checks_are_rechecked_sooner() {
+        let mut cache = ContextCache::default();
+        let calls = Cell::new(0);
+        let pending = |_: &str, _: &str| {
+            calls.set(calls.get() + 1);
+            RepoContext {
+                pr: Some(PullRequest {
+                    number: 1,
+                    title: String::new(),
+                    url: String::new(),
+                    state: PrState::Open,
+                    closes: None,
+                    checks: Some(Checks::Pending),
+                    review: None,
+                }),
+                ..RepoContext::default()
+            }
+        };
+        let t0 = Instant::now();
+        cache.get_at("/r", "b", t0, pending);
+        cache.get_at("/r", "b", t0 + PENDING_TTL, pending);
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

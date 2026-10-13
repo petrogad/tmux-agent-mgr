@@ -174,9 +174,14 @@ pub fn build(
                 Segment::new(format!("{glyph} "), Style::default().fg(color)),
                 Segment::new(format!("#{}", pr.number), link_style(palette.number, true))
                     .link(url.clone()),
+            ]
+            .into_iter()
+            .chain(flags(pr, palette))
+            .chain([
                 Segment::new(" ", Style::default()),
                 Segment::new(pr.title.clone(), Style::default().fg(palette.title)).link(url),
-            ]
+            ])
+            .collect()
         }
     };
     push(&mut card, total_width, pr_row, ticket);
@@ -223,6 +228,34 @@ pub fn link_at(card: &Card, col: u16, row: u16) -> Option<&str> {
         .iter()
         .find(|l| l.row == row && col >= l.col && col < l.col + l.width)
         .map(|l| l.url.as_str())
+}
+
+/// What the PR is waiting on, right after its number: the checks as one glyph,
+/// then the review as one word. Only while the PR is live — on a merged or closed
+/// one, the state glyph has already said everything that matters.
+fn flags(pr: &crate::forge::PullRequest, palette: &crate::ui::theme::CardPalette) -> Vec<Segment> {
+    use crate::forge::{Checks, Review};
+    if !matches!(pr.state, PrState::Open | PrState::Draft) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(checks) = pr.checks {
+        let (glyph, color) = match checks {
+            Checks::Passing => ("✓", palette.pass),
+            Checks::Pending => ("◌", palette.pending),
+            Checks::Failing => ("✕", palette.fail),
+        };
+        out.push(Segment::new(format!(" {glyph}"), Style::default().fg(color)));
+    }
+    if let Some(review) = pr.review {
+        let (word, color) = match review {
+            Review::Approved => ("approved", palette.pass),
+            Review::ChangesRequested => ("changes", palette.fail),
+            Review::Required => ("review", palette.awaiting),
+        };
+        out.push(Segment::new(format!(" {word}"), Style::default().fg(color)));
+    }
+    out
 }
 
 fn link_style(color: Color, linked: bool) -> Style {
@@ -340,6 +373,8 @@ mod tests {
                 url: "https://github.com/o/flugo/pull/142".into(),
                 state: PrState::Open,
                 closes: None,
+                checks: None,
+                review: None,
             }),
         }
     }
@@ -494,6 +529,31 @@ mod tests {
         ctx.web = Some("https://github.com/a-rather-long-org/flugo".into());
         let card = build(Some(&pane("/w/flugo-ports", "ports")), Lookup::Done(&ctx), &tickets(), 24, &Theme::default());
         assert!(card.plain[1].starts_with(" flugo"), "{:?}", card.plain[1]);
+    }
+
+    #[test]
+    fn checks_and_review_flag_the_number() {
+        use crate::forge::{Checks, Review};
+        let mut ctx = with_pr("Derive ports");
+        let pr = ctx.pr.as_mut().unwrap();
+        pr.checks = Some(Checks::Failing);
+        pr.review = Some(Review::Approved);
+        let card = card_for("/w/flugo-ports", "ports", &ctx, &TicketConfig::default());
+        assert!(card.plain[3].starts_with(" ● #142 ✕ approved Derive ports"), "{:?}", card.plain[3]);
+        // The flags are not part of the link; the number and title are.
+        assert_eq!(url_at(&card, 3, "✕"), None);
+        assert_eq!(url_at(&card, 3, "Derive"), Some("https://github.com/o/flugo/pull/142"));
+    }
+
+    #[test]
+    fn a_finished_pr_carries_no_flags() {
+        use crate::forge::Checks;
+        let mut ctx = with_pr("Derive ports");
+        let pr = ctx.pr.as_mut().unwrap();
+        pr.state = PrState::Merged;
+        pr.checks = Some(Checks::Failing);
+        let card = card_for("/w/flugo-ports", "ports", &ctx, &TicketConfig::default());
+        assert!(card.plain[3].starts_with(" ✓ #142 Derive ports"));
     }
 
     #[test]

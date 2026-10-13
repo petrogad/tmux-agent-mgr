@@ -818,6 +818,8 @@ mod tests {
                     url: "https://github.com/o/r/pull/9".to_owned(),
                     state: crate::forge::PrState::Open,
                     closes: None,
+                    checks: None,
+                    review: None,
                 }),
             },
         );

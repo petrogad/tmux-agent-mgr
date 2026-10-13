@@ -83,6 +83,8 @@ mod mocha {
     pub const PINK: Color = Color::Rgb(0xf5, 0xc2, 0xe7);
     pub const MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
     pub const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+    pub const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
+    pub const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
     pub const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
     pub const SKY: Color = Color::Rgb(0x89, 0xdc, 0xeb);
     pub const SAPPHIRE: Color = Color::Rgb(0x74, 0xc7, 0xec);
@@ -110,6 +112,12 @@ pub struct CardPalette {
     pub merged: Color,
     pub closed: Color,
     pub rule: Color,
+    /// Checks passing / running / failing.
+    pub pass: Color,
+    pub pending: Color,
+    pub fail: Color,
+    /// A review still owed, as against approved (`pass`) or changes (`fail`).
+    pub awaiting: Color,
 }
 
 impl Default for CardPalette {
@@ -129,6 +137,10 @@ impl Default for CardPalette {
             merged: MAUVE,
             closed: RED,
             rule: SURFACE1,
+            pass: GREEN,
+            pending: YELLOW,
+            fail: RED,
+            awaiting: PEACH,
         }
     }
 }
