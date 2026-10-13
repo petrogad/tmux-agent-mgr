@@ -154,20 +154,29 @@ Window tabs also carry a rolled-up status glyph, appended to your existing
 
 ```
 ──────────────────────────────────
- flugo · pete/flu-88-ports  FLU-88
- ● #142 Derive ports from the bra…
+ petrogad/flugo
+ ▸ flugo-ports/apps · ⎇ pete/ports
+ ● #142 Derive ports from…  FLU-88
  all
 ```
 
-Pinned above the footer: the pane **tmux focus** is on, on the web. It follows
-focus rather than the cursor, so it changes when you switch panes and stays put
-while you move through the list. Folder (→ the repo), branch (→ its PR, else the
-branch), pull request (`●` open, `○` draft, `✓` merged, `✕` closed) and the
-ticket key found in the branch or PR title. **Click** any of them to open it — the
-sidebar opens the URL itself (`open` / `xdg-open`). They are also OSC 8
-hyperlinks, which is what a bypass-modifier click (Shift in WezTerm) uses when
-tmux runs on a remote host; the plugin adds `hyperlinks` to tmux's
-`terminal-features` for that.
+Pinned above the footer: the pane **tmux focus** is on. It follows focus rather
+than the cursor, so it changes when you switch panes and stays put while you move
+through the list. Three rows, broad to specific:
+
+- **repo** — as the remote names it (→ the repo)
+- **place** — the checkout directory and the path below it, which is what tells
+  two worktrees apart (→ that folder on the branch), then the branch (→ its PR,
+  else the branch)
+- **work** — the pull request (`●` open, `○` draft, `✓` merged, `✕` closed), and
+  pinned right, the ticket: a Jira-style key from the branch or PR title (→
+  `@agent_mgr_ticket_url`), else the GitHub issue the PR description closes
+  (`Fixes #12` → `◎ #12`)
+
+**Click** any of them to open it — the sidebar opens the URL itself (`open` /
+`xdg-open`). They are also OSC 8 hyperlinks, which is what a bypass-modifier click
+(Shift in WezTerm) uses when tmux runs on a remote host; the plugin adds
+`hyperlinks` to tmux's `terminal-features` for that.
 
 PRs come from [`gh`](https://cli.github.com/), so it needs to be installed and
 authenticated; without it the card still shows folder, branch and ticket. Lookups

@@ -811,11 +811,13 @@ mod tests {
             ("/tmp".to_owned(), "feat".to_owned()),
             crate::forge::RepoContext {
                 web: Some("https://github.com/o/r".to_owned()),
+                toplevel: Some("/tmp".to_owned()),
                 pr: Some(crate::forge::PullRequest {
                     number: 9,
                     title: "Ship it".to_owned(),
                     url: "https://github.com/o/r/pull/9".to_owned(),
                     state: crate::forge::PrState::Open,
+                    closes: None,
                 }),
             },
         );
@@ -830,8 +832,8 @@ mod tests {
         let (app, worker) = card_fixture(3);
         let _ = &worker;
         let top = app.card_top().expect("card is up at 40 rows");
-        let pr_row = top + 2;
-        let col = app.card.plain[2].find('#').unwrap() as u16 - 2; // `●` is 3 bytes
+        let pr_row = top + 3;
+        let col = app.card.plain[3].find('#').unwrap() as u16 - 2; // `●` is 3 bytes
         assert_eq!(card_link(&app, col, pr_row).as_deref(), Some("https://github.com/o/r/pull/9"));
         assert_eq!(card_link(&app, 0, pr_row), None);
         assert_eq!(card_link(&app, col, top), None, "the rule");

@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(list_height(2, 0), 0);
         assert_eq!(list_height(1, 0), 0);
         assert_eq!(list_height(0, 0), 0);
-        assert_eq!(list_height(40, card::HEIGHT), 35);
+        assert_eq!(list_height(40, card::HEIGHT), 34);
     }
 
     // ─── preview styling ──────────────────────────────────────────────

@@ -23,11 +23,32 @@ const TTL: Duration = Duration::from_secs(60);
 pub struct RepoContext {
     /// `https://host/owner/repo`, or `None` when there is no usable remote.
     pub web: Option<String>,
+    /// The checkout's root directory, so the card can say where in it you are.
+    pub toplevel: Option<String>,
     /// The PR whose head is this branch, open or not.
     pub pr: Option<PullRequest>,
 }
 
 impl RepoContext {
+    /// The page for `path` on `branch`, when `path` is inside this checkout.
+    pub fn folder_url(&self, branch: &str, path: &str) -> Option<String> {
+        let web = self.web.as_ref()?;
+        let rel = relative(self.toplevel.as_deref()?, path)?;
+        if branch.is_empty() {
+            return None;
+        }
+        Some(if rel.is_empty() {
+            format!("{web}/tree/{branch}")
+        } else {
+            format!("{web}/tree/{branch}/{rel}")
+        })
+    }
+
+    /// The issue page for `number`.
+    pub fn issue_url(&self, number: u64) -> Option<String> {
+        Some(format!("{}/issues/{number}", self.web.as_ref()?))
+    }
+
     /// Where the branch name should take you: its PR when there is one, the branch
     /// itself on the forge when there is not.
     pub fn branch_url(&self, branch: &str) -> Option<String> {
@@ -45,6 +66,19 @@ pub struct PullRequest {
     pub title: String,
     pub url: String,
     pub state: PrState,
+    /// The first issue the description says it closes (`Fixes #12`).
+    pub closes: Option<u64>,
+}
+
+/// `path` relative to `root`: `Some("")` at the root itself, `None` outside it.
+pub fn relative(root: &str, path: &str) -> Option<String> {
+    let root = root.trim_end_matches('/');
+    let rest = path.strip_prefix(root)?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    // `/repo-other` is not inside `/repo`.
+    rest.strip_prefix('/').map(|rel| rel.trim_end_matches('/').to_owned())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -92,25 +126,26 @@ impl ContextCache {
     }
 }
 
-/// Ask git for the remote and `gh` for the PR. Two subprocesses, the second one
-/// skipped when there is no forge to ask.
+/// Ask git for the remote and root, and `gh` for the PR. The `gh` call is skipped
+/// when there is no forge to ask.
 fn lookup(path: &str, branch: &str) -> RepoContext {
     let web = run("git", path, &["remote", "get-url", "origin"])
         .as_deref()
         .and_then(web_url);
+    let toplevel = run("git", path, &["rev-parse", "--show-toplevel"]);
     let pr = match &web {
         // No branch argument: bare `gh pr view` resolves the checkout's own push
         // target, which survives a local branch named differently from its remote.
         Some(_) if !branch.is_empty() => run(
             "gh",
             path,
-            &["pr", "view", "--json", "number,title,url,state,isDraft"],
+            &["pr", "view", "--json", "number,title,url,state,isDraft,body"],
         )
         .as_deref()
         .and_then(parse_pr),
         _ => None,
     };
-    RepoContext { web, pr }
+    RepoContext { web, toplevel, pr }
 }
 
 /// The browsable URL for a git remote.
@@ -145,7 +180,7 @@ pub fn web_url(remote: &str) -> Option<String> {
     Some(format!("https://{host}/{path}"))
 }
 
-/// Parse `gh pr view --json number,title,url,state,isDraft`.
+/// Parse `gh pr view --json number,title,url,state,isDraft,body`.
 fn parse_pr(json: &str) -> Option<PullRequest> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let state = match (value["state"].as_str()?, value["isDraft"].as_bool()) {
@@ -160,6 +195,32 @@ fn parse_pr(json: &str) -> Option<PullRequest> {
         title: value["title"].as_str()?.trim().to_owned(),
         url: value["url"].as_str()?.to_owned(),
         state,
+        closes: value["body"].as_str().and_then(closing_issue),
+    })
+}
+
+/// The first `#N` a PR description closes with GitHub's own keywords.
+///
+/// Read from the body because `closingIssuesReferences` needs a newer `gh` than
+/// is commonly installed. Only the same-repo `#N` form: `owner/repo#N` names an
+/// issue elsewhere, and linking it under this repo would be wrong.
+fn closing_issue(body: &str) -> Option<u64> {
+    const KEYWORDS: [&str; 9] = [
+        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+    ];
+    let lower = body.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    words.windows(2).find_map(|pair| {
+        let keyword = pair[0].trim_end_matches(':');
+        if !KEYWORDS.contains(&keyword) {
+            return None;
+        }
+        let digits: String = pair[1]
+            .strip_prefix('#')?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
     })
 }
 
@@ -327,6 +388,7 @@ mod tests {
     fn the_branch_links_to_its_pr_before_its_tree() {
         let mut ctx = RepoContext {
             web: Some("https://github.com/o/r".into()),
+            toplevel: None,
             pr: None,
         };
         assert_eq!(
@@ -338,8 +400,39 @@ mod tests {
             title: "t".into(),
             url: "https://github.com/o/r/pull/7".into(),
             state: PrState::Open,
+            closes: None,
         });
         assert_eq!(ctx.branch_url("pete/ports").as_deref(), Some("https://github.com/o/r/pull/7"));
+    }
+
+    #[test]
+    fn a_closing_keyword_names_the_issue() {
+        assert_eq!(closing_issue("Some text.\n\nFixes #12"), Some(12));
+        assert_eq!(closing_issue("closes: #7, and more"), Some(7));
+        assert_eq!(closing_issue("Resolves #3.\nCloses #4"), Some(3));
+        // A mention is not a close, and another repo's issue is not ours.
+        assert_eq!(closing_issue("see #12"), None);
+        assert_eq!(closing_issue("Fixes other/repo#12"), None);
+        assert_eq!(closing_issue(""), None);
+    }
+
+    #[test]
+    fn a_folder_links_to_itself_on_the_branch() {
+        let ctx = RepoContext {
+            web: Some("https://github.com/o/flugo".into()),
+            toplevel: Some("/w/flugo-ports".into()),
+            pr: None,
+        };
+        assert_eq!(
+            ctx.folder_url("ports", "/w/flugo-ports/apps/android").as_deref(),
+            Some("https://github.com/o/flugo/tree/ports/apps/android")
+        );
+        assert_eq!(
+            ctx.folder_url("ports", "/w/flugo-ports").as_deref(),
+            Some("https://github.com/o/flugo/tree/ports")
+        );
+        assert_eq!(ctx.folder_url("ports", "/w/flugo-ports-old"), None);
+        assert_eq!(ctx.issue_url(5).as_deref(), Some("https://github.com/o/flugo/issues/5"));
     }
 
     #[test]
